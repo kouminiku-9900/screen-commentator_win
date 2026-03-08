@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 from typing import Callable
+from urllib.parse import urlparse
 
 import httpx
 
@@ -20,10 +21,6 @@ from .paths import ResolvedLmStudioPaths
 
 logger = logging.getLogger(__name__)
 
-
-MODEL_PREFIX = "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive"
-MODEL_KEY = MODEL_PREFIX.lower()
-MMPROJ_FILENAME = f"mmproj-{MODEL_PREFIX}-BF16.gguf"
 INSTALL_SCRIPT_URL = "https://lmstudio.ai/install.ps1"
 DAEMON_START_TIMEOUT_SEC = 60.0
 LOAD_TIMEOUT_SEC = 600.0
@@ -311,15 +308,16 @@ class RuntimeManager:
                 raise RuntimeErrorWithDetails(f"Model download failed: {status_payload}")
 
     def verify_model_files(self) -> ModelFiles:
-        quantized_name = f"{MODEL_PREFIX}-{self.config.runtime.quantization}.gguf"
         installation = self._require_installation()
-        search_root = installation.lmstudio_home if installation.lmstudio_home.exists() else self.paths.llmster_home
-        main_file = next(search_root.rglob(quantized_name), None)
-        mmproj_file = next(search_root.rglob(MMPROJ_FILENAME), None)
+        models_root = installation.lmstudio_home / "models"
+        search_root = models_root if models_root.exists() else self.paths.llmster_home
+        repo_root = self._downloaded_model_dir(search_root)
+        main_file = self._find_main_model_file(repo_root)
+        mmproj_file = self._find_mmproj_file(repo_root)
         if not main_file or not mmproj_file:
             raise RuntimeErrorWithDetails(
                 "Expected model files were not found after download. "
-                f"main={quantized_name} mmproj={MMPROJ_FILENAME}"
+                f"repo={self.config.runtime.model_repo_url} quantization={self.config.runtime.quantization}"
             )
         return ModelFiles(main_file=main_file, mmproj_file=mmproj_file)
 
@@ -513,7 +511,7 @@ class RuntimeManager:
                 if model_key:
                     return model_key
 
-        return MODEL_KEY
+        return files.main_file.stem.lower()
 
     def _list_available_models(self) -> list[dict]:
         payload = self._run_json_command(
@@ -652,6 +650,77 @@ class RuntimeManager:
         raise RuntimeErrorWithDetails(
             "llmster is not installed correctly in the app-local runtime directory."
         )
+
+    def _downloaded_model_dir(self, search_root):
+        owner, repo = self._configured_repo_parts()
+        direct_path = search_root / owner / repo
+        if direct_path.exists():
+            return direct_path
+
+        nested_candidates = list(search_root.rglob(repo))
+        directory_candidates = [path for path in nested_candidates if path.is_dir() and path.name == repo]
+        if directory_candidates:
+            directory_candidates.sort(key=lambda path: len(path.parts))
+            return directory_candidates[0]
+
+        raise RuntimeErrorWithDetails(
+            "The configured model repository was not found under the app-local runtime. "
+            f"Expected to find {owner}/{repo} inside {search_root}."
+        )
+
+    def _configured_repo_parts(self) -> tuple[str, str]:
+        raw = self.config.runtime.model_repo_url.strip().rstrip("/")
+        if not raw:
+            raise RuntimeErrorWithDetails("runtime.model_repo_url must not be empty.")
+
+        if "://" in raw:
+            parsed = urlparse(raw)
+            path = parsed.path.strip("/")
+        else:
+            path = raw.strip("/")
+
+        parts = [segment for segment in path.split("/") if segment]
+        if len(parts) < 2:
+            raise RuntimeErrorWithDetails(
+                "runtime.model_repo_url must point to a Hugging Face repository like owner/repo."
+            )
+        return parts[0], parts[1]
+
+    def _find_main_model_file(self, repo_root):
+        quantization_suffix = f"-{self.config.runtime.quantization}.gguf".lower()
+        candidates = [
+            path
+            for path in repo_root.rglob("*.gguf")
+            if not path.name.lower().startswith("mmproj-")
+        ]
+        exact_matches = [path for path in candidates if path.name.lower().endswith(quantization_suffix)]
+        if exact_matches:
+            exact_matches.sort(key=lambda path: (len(path.parts), len(path.name)))
+            return exact_matches[0]
+        return None
+
+    @staticmethod
+    def _find_mmproj_file(repo_root):
+        preferred_names = [
+            "mmproj-bf16.gguf",
+            "mmproj-f16.gguf",
+            "mmproj-f32.gguf",
+        ]
+        candidates = [
+            path
+            for path in repo_root.rglob("*.gguf")
+            if path.name.lower().startswith("mmproj")
+        ]
+        if not candidates:
+            return None
+
+        for preferred_name in preferred_names:
+            for candidate in candidates:
+                if candidate.name.lower() == preferred_name:
+                    return candidate
+
+        candidates.sort(key=lambda path: (len(path.parts), len(path.name)))
+        return candidates[0]
 
     def _wait_for_app_local_cli_key(self, progress: ProgressCallback, key_file) -> None:
         deadline = time.time() + DAEMON_START_TIMEOUT_SEC

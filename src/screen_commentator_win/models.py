@@ -66,7 +66,7 @@ class RuntimeConfig:
     quantization: str = "Q4_K_M"
     context_length: int = 16384
     gpu: str = "max"
-    model_repo_url: str = "https://huggingface.co/HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive"
+    model_repo_url: str = "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF"
     instance_id: str = "screen-commentator-vlm"
     api_key: str = "lm-studio"
     request_timeout_sec: float = 120.0

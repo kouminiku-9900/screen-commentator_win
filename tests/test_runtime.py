@@ -276,10 +276,10 @@ def test_verify_model_files_requires_main_and_mmproj(monkeypatch, tmp_path) -> N
     config = AppConfig()
     paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
     paths.lms_executable.write_bytes(b"binary")
-    model_dir = paths.llmster_home / ".lmstudio" / "models"
+    model_dir = paths.llmster_home / ".lmstudio" / "models" / "unsloth" / "Qwen3.5-4B-GGUF"
     model_dir.mkdir(parents=True, exist_ok=True)
-    main_file = model_dir / "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"
-    mmproj_file = model_dir / "mmproj-Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf"
+    main_file = model_dir / "Qwen3.5-4B-Q4_K_M.gguf"
+    mmproj_file = model_dir / "mmproj-BF16.gguf"
     main_file.write_bytes(b"main")
     mmproj_file.write_bytes(b"mmproj")
 
@@ -290,6 +290,27 @@ def test_verify_model_files_requires_main_and_mmproj(monkeypatch, tmp_path) -> N
     assert files.mmproj_file == mmproj_file
 
 
+def test_verify_model_files_respects_configured_repo_url(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path))
+    paths = AppPaths.discover()
+    config = AppConfig()
+    config.runtime.model_repo_url = "https://huggingface.co/example-org/custom-vlm-gguf"
+    config.runtime.quantization = "Q8_0"
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"binary")
+    model_dir = paths.llmster_home / ".lmstudio" / "models" / "example-org" / "custom-vlm-gguf"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    main_file = model_dir / "custom-vlm-Q8_0.gguf"
+    mmproj_file = model_dir / "mmproj-F16.gguf"
+    main_file.write_bytes(b"main")
+    mmproj_file.write_bytes(b"mmproj")
+
+    runtime = RuntimeManager(paths=paths, config=config)
+    files = runtime.verify_model_files()
+
+    assert files == ModelFiles(main_file=main_file, mmproj_file=mmproj_file)
+
+
 def test_load_model_uses_model_key_and_yes_flag(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path))
     paths = AppPaths.discover()
@@ -298,10 +319,10 @@ def test_load_model_uses_model_key_and_yes_flag(monkeypatch, tmp_path) -> None:
     progress_state: list[tuple[str, float | None]] = []
     paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
     paths.lms_executable.write_bytes(b"binary")
-    model_dir = paths.llmster_home / ".lmstudio" / "models" / "HauhauCS" / "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive"
+    model_dir = paths.llmster_home / ".lmstudio" / "models" / "unsloth" / "Qwen3.5-4B-GGUF"
     model_dir.mkdir(parents=True, exist_ok=True)
-    main_file = model_dir / "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"
-    mmproj_file = model_dir / "mmproj-Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf"
+    main_file = model_dir / "Qwen3.5-4B-Q4_K_M.gguf"
+    mmproj_file = model_dir / "mmproj-BF16.gguf"
     main_file.write_bytes(b"main")
     mmproj_file.write_bytes(b"mmproj")
 
@@ -336,9 +357,8 @@ def test_load_model_uses_model_key_and_yes_flag(monkeypatch, tmp_path) -> None:
         "_list_available_models",
         lambda: [
             {
-                "path": "HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive/"
-                "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
-                "modelKey": "qwen3.5-4b-uncensored-hauhaucs-aggressive",
+                "path": "unsloth/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf",
+                "modelKey": "unsloth/qwen3.5-4b-gguf/qwen3.5-4b-q4_k_m",
             }
         ],
     )
@@ -357,7 +377,7 @@ def test_load_model_uses_model_key_and_yes_flag(monkeypatch, tmp_path) -> None:
         [
             str(paths.lms_executable),
             "load",
-            "qwen3.5-4b-uncensored-hauhaucs-aggressive",
+            "unsloth/qwen3.5-4b-gguf/qwen3.5-4b-q4_k_m",
             "--context-length",
             "16384",
             "--gpu",

@@ -14,7 +14,7 @@
 - Swift / macOS 実装ではなく Python メインへ再構成
 - GUI は `Install` / `Start` / `Stop` の最小ランチャーに整理
 - LLM 実行環境は `llmster` ベースに一本化
-- モデルは `HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive` 固定
+- 既定モデルは `unsloth/Qwen3.5-4B-GGUF`
 - パイプラインは multimodal `smart` 相当のみを維持
 - 外部 API モードは廃止
 - `%LOCALAPPDATA%\ScreenCommentatorWin\` 配下へ runtime を隔離
@@ -40,7 +40,7 @@
 - `state\`
 - `llmster-home\`
 
-`Install` では `llmster` と固定モデルを取得し、通常の PATH は変更しません。
+`Install` では `llmster` と設定中の Hugging Face モデルを取得し、通常の PATH は変更しません。
 
 ## Requirements
 
@@ -70,6 +70,32 @@ pwsh -File .\scripts\build.ps1
 
 ビルド時には packaged exe に対して self-test を実行し、overlay PNG まで確認します。
 
+## Install And First Run
+
+GitHub から取得して使う前提なら、最短手順はこれです。
+
+```powershell
+pwsh -File .\scripts\build.ps1
+.\release\ScreenCommentatorLauncher\ScreenCommentatorLauncher.exe
+```
+
+初回はランチャーで `Install` を押してください。  
+これで app-local の `llmster` と、`config.toml` で指定されたモデルを `%LOCALAPPDATA%\ScreenCommentatorWin\` 配下へ取得します。
+
+## Changing The Model
+
+モデル repo は `%LOCALAPPDATA%\ScreenCommentatorWin\config.toml` の `runtime.model_repo_url` で切り替えられます。  
+既定値は `unsloth/Qwen3.5-4B-GGUF` です。
+
+```toml
+[runtime]
+model_repo_url = "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF"
+quantization = "Q4_K_M"
+```
+
+別モデルへ変える場合は、この URL を Hugging Face の repo URL に差し替えてから再度 `Install` を押してください。  
+この fork は multimodal 用なので、GGUF 本体だけでなく `mmproj` も含まれる repo を使ってください。
+
 ## Notes
 
 - GUI から設定変更はしません。必要なら `%LOCALAPPDATA%\ScreenCommentatorWin\config.toml` を編集してください。
@@ -92,6 +118,17 @@ pwsh -File .\scripts\build.ps1
 
 この fork は user-profile 側の `%USERPROFILE%\.lmstudio\` を使いません。  
 アンインストール対象は app-local の `%LOCALAPPDATA%\ScreenCommentatorWin\` だけです。
+
+## Third-Party Software, Model Licenses, And Disclaimer
+
+- この repository のコード自体は [MIT](./LICENSE) です。
+- `llmster` / LM Studio は別ソフトウェアです。利用時はそれぞれの利用条件に従ってください。
+  - LM Studio Terms: [https://lmstudio.ai/terms](https://lmstudio.ai/terms)
+- 既定モデルは Hugging Face の [unsloth/Qwen3.5-4B-GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) を参照します。
+  - 2026-03-08 時点の Hugging Face 表記では `apache-2.0` です。
+- モデルを差し替える場合、その weights / GGUF / mmproj のライセンス確認は利用者側で行ってください。
+- この fork は個人の趣味・検証用途を想定しています。
+- 生成結果の内容、正確性、安全性、適法性について作者は保証しません。利用と生成物の扱いは各利用者の責任で行ってください。
 
 ## License
 
