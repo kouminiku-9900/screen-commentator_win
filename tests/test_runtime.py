@@ -411,21 +411,57 @@ def test_kill_stale_daemons_terminates_app_local_llmster(monkeypatch, tmp_path) 
         {"Id": 5678, "Path": "C:\\Program Files\\LM Studio\\llmster.exe"},
     ])
     killed_pids: list[str] = []
+    taskkill_commands: list[list[str]] = []
 
     def fake_subprocess_run(command, **kwargs):
         if "powershell" in command[0].lower():
             return subprocess.CompletedProcess(command, 0, ps_output, "")
         if "taskkill" in command[0].lower():
+            taskkill_commands.append(list(command))
             killed_pids.append(command[command.index("/PID") + 1])
             return subprocess.CompletedProcess(command, 0, "", "")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr("screen_commentator_win.runtime.subprocess.run", fake_subprocess_run)
+    monkeypatch.setattr("screen_commentator_win.runtime.time.sleep", lambda *_: None)
 
     runtime._kill_stale_daemons(progress.append)
 
     assert killed_pids == ["1234"]
     assert "5678" not in killed_pids
+    # Verify /T (tree kill) flag is used
+    assert "/T" in taskkill_commands[0]
+
+
+def test_kill_stale_daemons_tries_graceful_cli_stop_first(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path))
+    paths = AppPaths.discover()
+    config = AppConfig()
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"binary")
+    # Create the key file so the CLI path is taken.
+    key_dir = paths.llmstudio_home / ".internal"
+    key_dir.mkdir(parents=True, exist_ok=True)
+    (key_dir / "lms-key-2").write_text("key", encoding="utf-8")
+    runtime = RuntimeManager(paths=paths, config=config)
+    progress: list[str] = []
+
+    run_commands: list[list[str]] = []
+
+    def fake_subprocess_run(command, **kwargs):
+        run_commands.append(list(command))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("screen_commentator_win.runtime.subprocess.run", fake_subprocess_run)
+    monkeypatch.setattr("screen_commentator_win.runtime.time.sleep", lambda *_: None)
+
+    runtime._kill_stale_daemons(progress.append)
+
+    # First command should be the graceful CLI stop.
+    assert run_commands[0][0] == str(paths.lms_executable)
+    assert "daemon" in run_commands[0]
+    assert "down" in run_commands[0]
+    assert any("Stopping existing llmster daemon" in msg for msg in progress)
 
 
 def test_verify_daemon_stable_raises_on_early_exit(monkeypatch, tmp_path) -> None:
