@@ -78,6 +78,30 @@ pwsh -File .\scripts\build.ps1
 - `Stop` は生成停止、overlay clear、model unload、server 停止、daemon 停止を行います。
 - `%LOCALAPPDATA%` を汚したくないテストでは `SCW_APP_ROOT` を使えます。
 
+## Uninstall
+
+### App-local files only
+
+この fork を消すだけなら、まずランチャーを閉じてから以下を削除してください。
+
+- `%LOCALAPPDATA%\ScreenCommentatorWin\`
+- 配布版を展開したフォルダ
+- 必要なら `release\ScreenCommentatorLauncher\` と `release\ScreenCommentatorLauncher-win64.zip`
+
+### If LM Studio user-profile storage was used
+
+環境によっては `llmster` / model が既存の user-profile 側 LM Studio を使うことがあります。  
+その場合、固定モデルは次の場所に入っている可能性があります。
+
+- `%USERPROFILE%\.lmstudio\models\HauhauCS\Qwen3.5-4B-Uncensored-HauhauCS-Aggressive\`
+
+このモデルだけ不要なら、そのフォルダだけ削除してください。
+
+### Important caution
+
+すでに LM Studio を他用途で使っている場合は、`%USERPROFILE%\.lmstudio\` 全体を削除しないでください。  
+この fork が使うモデルだけを消したい場合は、上のモデルディレクトリだけを削除するのが安全です。
+
 ## License
 
 MIT.  
