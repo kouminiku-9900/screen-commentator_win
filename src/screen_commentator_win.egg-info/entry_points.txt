@@ -1,2 +1,0 @@
-[console_scripts]
-screen-commentator-win = screen_commentator_win.app:main

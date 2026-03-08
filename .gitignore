@@ -9,5 +9,6 @@ __pycache__/
 *.pyo
 *.pyd
 *.spec
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
