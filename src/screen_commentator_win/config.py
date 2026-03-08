@@ -18,6 +18,12 @@ from .models import (
 from .paths import AppPaths
 
 
+LEGACY_DEFAULT_MODEL_REPO_URLS = {
+    "https://huggingface.co/HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive",
+    "HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive",
+}
+
+
 class ConfigManager:
     def __init__(self, paths: AppPaths) -> None:
         self.paths = paths
@@ -31,7 +37,11 @@ class ConfigManager:
 
         with self.paths.config_file.open("rb") as handle:
             raw = tomllib.load(handle)
-        return self._from_dict(raw)
+        migrated_raw, changed = self._migrate(raw)
+        config = self._from_dict(migrated_raw)
+        if changed:
+            self.save(config)
+        return config
 
     def save(self, config: AppConfig) -> None:
         self.paths.ensure_directories()
@@ -71,8 +81,19 @@ class ConfigManager:
             personas=personas,
         )
 
+    def _migrate(self, raw: dict) -> tuple[dict, bool]:
+        changed = False
+        migrated = dict(raw)
+        runtime_section = dict(migrated.get("runtime", {}))
+        model_repo_url = str(runtime_section.get("model_repo_url", "")).strip()
+        default_model_repo_url = RuntimeConfig().model_repo_url
+        if model_repo_url in LEGACY_DEFAULT_MODEL_REPO_URLS:
+            runtime_section["model_repo_url"] = default_model_repo_url
+            migrated["runtime"] = runtime_section
+            changed = True
+        return migrated, changed
+
 
 def config_path_for_user(paths: AppPaths) -> Path:
     paths.ensure_directories()
     return paths.config_file
-
