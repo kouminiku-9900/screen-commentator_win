@@ -58,7 +58,6 @@ def test_download_model_uses_cli_and_reports_progress(monkeypatch, tmp_path) -> 
             str(paths.lms_executable),
             "get",
             "unsloth/Qwen3.5-4B-GGUF@q4_k_m",
-            "--gguf",
             "--yes",
         ]
     ]

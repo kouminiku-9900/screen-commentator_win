@@ -266,7 +266,6 @@ class RuntimeManager:
             str(installation.lms_executable),
             "get",
             self._download_request_target(),
-            "--gguf",
             "--yes",
         ]
         progress(f"$ {' '.join(command)}")
