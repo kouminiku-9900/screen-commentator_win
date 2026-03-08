@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
+from pathlib import Path
 
 import httpx
 import pytest
@@ -185,6 +187,7 @@ def test_start_daemon_reports_running_lm_studio_conflict(monkeypatch, tmp_path) 
 
     monkeypatch.setattr("screen_commentator_win.runtime.subprocess.Popen", fake_popen)
     monkeypatch.setattr(runtime, "_kill_stale_processes", lambda progress: None)
+    monkeypatch.setattr(runtime, "_daemon_status_command_succeeds", lambda installation: False)
     progress: list[str] = []
 
     with pytest.raises(RuntimeErrorWithDetails, match="Close LM Studio completely and try again"):
@@ -272,6 +275,120 @@ def test_start_server_uses_app_local_installation(monkeypatch, tmp_path) -> None
     assert progress[-1] == "llmster server is ready."
 
 
+def test_start_server_prefers_bundled_lms_when_available(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path / "app-root"))
+    paths = AppPaths.discover()
+    config = AppConfig()
+    progress: list[str] = []
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"local")
+    daemon_executable = paths.llmstudio_home / "llmster" / "0.0.6-1" / "llmster.exe"
+    bundled_lms = daemon_executable.parent / ".bundle" / "lms.exe"
+    bundled_lms.parent.mkdir(parents=True, exist_ok=True)
+    daemon_executable.write_bytes(b"daemon")
+    bundled_lms.write_bytes(b"bundle-lms")
+    paths.llmster_install_location_file.parent.mkdir(parents=True, exist_ok=True)
+    paths.llmster_install_location_file.write_text(
+        json.dumps({"path": str(daemon_executable)}),
+        encoding="utf-8",
+    )
+
+    runtime = RuntimeManager(paths=paths, config=config)
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = []
+
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout=None) -> int:
+            return 0
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        return FakeProcess()
+
+    def fake_wait_for_server(progress_callback, installation=None, process=None):
+        progress_callback("llmster server is ready.")
+
+    monkeypatch.setattr("screen_commentator_win.runtime.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(runtime, "_server_status_for_installation", lambda installation: {"running": False})
+    monkeypatch.setattr(runtime, "_wait_for_server", fake_wait_for_server)
+
+    runtime.start_server(progress.append)
+
+    assert captured["command"][0] == str(bundled_lms)
+
+
+def test_start_server_falls_back_to_installation_lms_when_bundled_fails(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path / "app-root"))
+    paths = AppPaths.discover()
+    config = AppConfig()
+    progress: list[str] = []
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"local")
+    daemon_executable = paths.llmstudio_home / "llmster" / "0.0.6-1" / "llmster.exe"
+    bundled_lms = daemon_executable.parent / ".bundle" / "lms.exe"
+    bundled_lms.parent.mkdir(parents=True, exist_ok=True)
+    daemon_executable.write_bytes(b"daemon")
+    bundled_lms.write_bytes(b"bundle-lms")
+    paths.llmster_install_location_file.parent.mkdir(parents=True, exist_ok=True)
+    paths.llmster_install_location_file.write_text(
+        json.dumps({"path": str(daemon_executable)}),
+        encoding="utf-8",
+    )
+
+    runtime = RuntimeManager(paths=paths, config=config)
+    commands: list[list[str]] = []
+
+    class FakeProcess:
+        def __init__(self, command) -> None:
+            self.command = command
+            self.stdout = []
+
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout=None) -> int:
+            return 0
+
+    def fake_popen(command, **kwargs):
+        commands.append(command)
+        return FakeProcess(command)
+
+    wait_calls = 0
+
+    def fake_wait_for_server(progress_callback, installation=None, process=None):
+        nonlocal wait_calls
+        wait_calls += 1
+        if wait_calls == 1:
+            raise RuntimeErrorWithDetails("bundled cli failed")
+        progress_callback("llmster server is ready.")
+
+    monkeypatch.setattr("screen_commentator_win.runtime.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(runtime, "_server_status_for_installation", lambda installation: {"running": False})
+    monkeypatch.setattr(runtime, "_wait_for_server", fake_wait_for_server)
+    monkeypatch.setattr(runtime, "_terminate_process_tree", lambda process: None)
+
+    runtime.start_server(progress.append)
+
+    assert commands == [
+        [str(bundled_lms), "server", "start", "--port", str(config.runtime.port)],
+        [str(paths.lms_executable), "server", "start", "--port", str(config.runtime.port)],
+    ]
+    assert progress[-1] == "llmster server is ready."
+
+
 def test_verify_model_files_requires_main_and_mmproj(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path))
     paths = AppPaths.discover()
@@ -313,7 +430,7 @@ def test_verify_model_files_respects_configured_repo_url(monkeypatch, tmp_path) 
     assert files == ModelFiles(main_file=main_file, mmproj_file=mmproj_file)
 
 
-def test_load_model_uses_model_key_and_yes_flag(monkeypatch, tmp_path) -> None:
+def test_load_model_uses_rest_load_and_tracks_active_instance(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path))
     paths = AppPaths.discover()
     config = AppConfig()
@@ -328,30 +445,17 @@ def test_load_model_uses_model_key_and_yes_flag(monkeypatch, tmp_path) -> None:
     main_file.write_bytes(b"main")
     mmproj_file.write_bytes(b"mmproj")
 
-    runtime = RuntimeManager(paths=paths, config=config)
-    commands: list[list[str]] = []
+    seen_requests: list[tuple[str, dict[str, object]]] = []
 
-    class FakeProcess:
-        def __init__(self, command, **kwargs) -> None:
-            commands.append(command)
-            self.stdout = []
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append((str(request.url), json.loads(request.content.decode("utf-8"))))
+        return httpx.Response(200, json={"instance_id": "loaded-qwen-instance"})
 
-        def poll(self):
-            return None
-
-        def terminate(self) -> None:
-            return None
-
-        def wait(self, timeout=None) -> int:
-            return 0
-
-    loaded_states = iter(
-        [
-            None,
-            {"identifier": config.runtime.instance_id, "status": "idle"},
-        ]
+    runtime = RuntimeManager(
+        paths=paths,
+        config=config,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
-    monotonic_values = iter([100.0, 100.0, 104.0, 105.0])
 
     monkeypatch.setattr(runtime, "unload_model", lambda progress, ignore_errors=False: None)
     monkeypatch.setattr(
@@ -364,10 +468,6 @@ def test_load_model_uses_model_key_and_yes_flag(monkeypatch, tmp_path) -> None:
             }
         ],
     )
-    monkeypatch.setattr(runtime, "_loaded_model_entry", lambda identifier: next(loaded_states))
-    monkeypatch.setattr("screen_commentator_win.runtime.subprocess.Popen", FakeProcess)
-    monkeypatch.setattr("screen_commentator_win.runtime.time.sleep", lambda *_: None)
-    monkeypatch.setattr("screen_commentator_win.runtime.time.monotonic", lambda: next(monotonic_values))
 
     files = runtime.load_model(
         progress.append,
@@ -375,25 +475,122 @@ def test_load_model_uses_model_key_and_yes_flag(monkeypatch, tmp_path) -> None:
     )
 
     assert files == ModelFiles(main_file=main_file, mmproj_file=mmproj_file)
-    assert commands == [
-        [
-            str(paths.lms_executable),
-            "load",
-            "unsloth/qwen3.5-4b-gguf/qwen3.5-4b-q4_k_m",
-            "--context-length",
-            "16384",
-            "--gpu",
-            "max",
-            "--identifier",
-            "screen-commentator-vlm",
-            "--yes",
-        ]
+    assert seen_requests == [
+        (
+            "http://127.0.0.1:12346/api/v1/models/load",
+            {
+                "model": "unsloth/qwen3.5-4b-gguf/qwen3.5-4b-q4_k_m",
+                "context_length": config.runtime.context_length,
+            },
+        )
     ]
+    assert runtime.create_inference_client().instance_id == "loaded-qwen-instance"
     assert progress[-1] == "Multimodal model is loaded."
     assert progress_state == [
-        ("Loading multimodal model... (estimated)", 0.5),
         ("Loading multimodal model...", 1.0),
     ]
+
+
+def test_stop_server_terminates_tracked_process_without_cli(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path))
+    paths = AppPaths.discover()
+    config = AppConfig()
+    progress: list[str] = []
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"binary")
+
+    runtime = RuntimeManager(paths=paths, config=config)
+    taskkill_commands: list[list[str]] = []
+
+    class FakeProcess:
+        pid = 222
+
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout=None) -> int:
+            return 0
+
+    def fake_subprocess_run(command, **kwargs):
+        taskkill_commands.append(list(command))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    runtime._server_process = FakeProcess()
+    monkeypatch.setattr("screen_commentator_win.runtime.subprocess.run", fake_subprocess_run)
+
+    runtime.stop_server(progress.append)
+
+    assert taskkill_commands == [["taskkill", "/F", "/T", "/PID", "222"]]
+    assert runtime._server_process is None
+    assert progress == ["Stopping llmster server..."]
+
+
+def test_stop_daemon_terminates_tracked_and_stale_processes(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path))
+    paths = AppPaths.discover()
+    config = AppConfig()
+    progress: list[str] = []
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"binary")
+    key_dir = paths.llmstudio_home / ".internal"
+    key_dir.mkdir(parents=True, exist_ok=True)
+    key_file = key_dir / "lms-key-2"
+    key_file.write_text("key", encoding="utf-8")
+
+    runtime = RuntimeManager(paths=paths, config=config)
+    runtime._active_instance_id = "loaded-qwen-instance"
+
+    class FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout=None) -> int:
+            return 0
+
+    runtime._server_process = FakeProcess(222)
+    runtime._daemon_process = FakeProcess(111)
+
+    app_local_daemon = paths.llmstudio_home / "llmster" / "0.0.6-1" / "llmster.exe"
+    unrelated_daemon = tmp_path / "other-home" / "llmster.exe"
+    query_payload = [
+        {"Id": 333, "ProcessName": "llmster", "Path": str(app_local_daemon)},
+        {"Id": 444, "ProcessName": "llmster", "Path": str(unrelated_daemon)},
+    ]
+    query_commands: list[list[str]] = []
+    taskkill_commands: list[list[str]] = []
+
+    def fake_subprocess_run(command, **kwargs):
+        if command[0] == "powershell":
+            query_commands.append(list(command))
+            return subprocess.CompletedProcess(command, 0, json.dumps(query_payload), "")
+        if command[0] == "taskkill":
+            taskkill_commands.append(list(command))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("screen_commentator_win.runtime.subprocess.run", fake_subprocess_run)
+
+    runtime.stop_daemon(progress.append)
+
+    assert len(query_commands) == 1
+    assert taskkill_commands == [
+        ["taskkill", "/F", "/T", "/PID", "222"],
+        ["taskkill", "/F", "/T", "/PID", "111"],
+        ["taskkill", "/F", "/T", "/PID", "333"],
+    ]
+    assert runtime._server_process is None
+    assert runtime._daemon_process is None
+    assert runtime._active_instance_id is None
+    assert runtime._daemon_recent_output == []
+    assert not key_file.exists()
 
 
 def test_kill_stale_processes_runs_powershell_with_home_path(monkeypatch, tmp_path) -> None:
@@ -410,40 +607,144 @@ def test_kill_stale_processes_runs_powershell_with_home_path(monkeypatch, tmp_pa
     runtime = RuntimeManager(paths=paths, config=config)
     progress: list[str] = []
 
-    ps_commands: list[list[str]] = []
+    app_local_daemon = paths.llmstudio_home / "llmster" / "0.0.6-1" / "llmster.exe"
+    legacy_temp_daemon = (
+        Path(tempfile.gettempdir())
+        / "scw-llmster-direct-legacy"
+        / "llmster-home"
+        / ".lmstudio"
+        / "llmster"
+        / "0.0.6-1"
+        / "llmster.exe"
+    )
+    unrelated_daemon = tmp_path / "other-home" / "llmster.exe"
+
+    query_payload = [
+        {"Id": 101, "ProcessName": "llmster", "Path": str(app_local_daemon)},
+        {"Id": 202, "ProcessName": "llmster", "Path": str(legacy_temp_daemon)},
+        {"Id": 303, "ProcessName": "llmster", "Path": str(unrelated_daemon)},
+    ]
+    query_commands: list[list[str]] = []
+    taskkill_commands: list[list[str]] = []
 
     def fake_subprocess_run(command, **kwargs):
-        ps_commands.append(list(command))
+        if command[0] == "powershell":
+            query_commands.append(list(command))
+            return subprocess.CompletedProcess(command, 0, json.dumps(query_payload), "")
+        if command[0] == "taskkill":
+            taskkill_commands.append(list(command))
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr("screen_commentator_win.runtime.subprocess.run", fake_subprocess_run)
 
     runtime._kill_stale_processes(progress.append)
 
-    # PowerShell kills all processes under llmster-home.
-    assert len(ps_commands) == 1
-    ps_cmd = " ".join(ps_commands[0])
-    assert "Stop-Process" in ps_cmd
-    assert str(paths.llmster_home) in ps_cmd
-    # Key file should be removed.
+    assert len(query_commands) == 1
+    assert query_commands[0][:3] == ["powershell", "-NoProfile", "-Command"]
+    assert taskkill_commands == [
+        ["taskkill", "/F", "/T", "/PID", "101"],
+        ["taskkill", "/F", "/T", "/PID", "202"],
+    ]
     assert not key_file.exists()
 
 
-def test_verify_daemon_stable_raises_on_early_exit(monkeypatch, tmp_path) -> None:
+def test_wait_for_server_accepts_launcher_exit_after_http_ready(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path))
     paths = AppPaths.discover()
     config = AppConfig()
     runtime = RuntimeManager(paths=paths, config=config)
-
-    poll_count = 0
+    progress: list[str] = []
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"binary")
 
     class FakeProcess:
         def poll(self):
-            nonlocal poll_count
-            poll_count += 1
-            if poll_count >= 2:
-                return 1
+            return 1
+
+    status_values = iter(
+        [
+            {"running": False},
+            {"running": True, "port": config.runtime.port},
+        ]
+    )
+    time_values = iter([0.0, 0.0, 0.1])
+
+    monkeypatch.setattr(
+        runtime,
+        "_server_status_for_installation",
+        lambda installation: next(status_values),
+    )
+    monkeypatch.setattr("screen_commentator_win.runtime.time.sleep", lambda *_: None)
+    monkeypatch.setattr("screen_commentator_win.runtime.time.time", lambda: next(time_values))
+
+    runtime._wait_for_server(
+        progress.append,
+        installation=paths.app_local_installation(),
+        process=FakeProcess(),
+    )
+
+    assert progress[-1] == "llmster server is ready."
+
+
+def test_wait_for_app_local_cli_key_accepts_launcher_exit_after_daemon_ready(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path))
+    paths = AppPaths.discover()
+    config = AppConfig()
+    runtime = RuntimeManager(paths=paths, config=config)
+    progress: list[str] = []
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"binary")
+
+    class FakeProcess:
+        def poll(self):
+            return 0
+
+        def terminate(self) -> None:
             return None
+
+        def wait(self, timeout=None) -> int:
+            return 0
+
+    key_file = tmp_path / "lms-key-2"
+    key_file.write_text("key", encoding="utf-8")
+    runtime._daemon_process = FakeProcess()
+
+    ready_states = iter([False, True])
+    time_values = iter([0.0, 0.0, 0.1])
+
+    monkeypatch.setattr(
+        runtime,
+        "_daemon_status_command_succeeds",
+        lambda installation: next(ready_states),
+    )
+    monkeypatch.setattr("screen_commentator_win.runtime.time.sleep", lambda *_: None)
+    monkeypatch.setattr("screen_commentator_win.runtime.time.time", lambda: next(time_values))
+
+    runtime._wait_for_app_local_cli_key(progress.append, key_file)
+
+    assert progress[-1] == "Isolated llmster daemon is ready."
+    assert runtime._daemon_process is None
+
+
+def test_wait_for_app_local_cli_key_raises_on_early_exit(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path))
+    paths = AppPaths.discover()
+    config = AppConfig()
+    runtime = RuntimeManager(paths=paths, config=config)
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"binary")
+
+    class FakeProcess:
+        def poll(self):
+            return 1
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout=None) -> int:
+            return 1
 
     runtime._daemon_process = FakeProcess()
     runtime._daemon_recent_output = ["Cannot start: llmster already running"]
@@ -451,14 +752,55 @@ def test_verify_daemon_stable_raises_on_early_exit(monkeypatch, tmp_path) -> Non
     key_file = tmp_path / "lms-key-2"
     key_file.write_text("key", encoding="utf-8")
 
+    monkeypatch.setattr(runtime, "_daemon_status_command_succeeds", lambda installation: False)
     monkeypatch.setattr("screen_commentator_win.runtime.time.sleep", lambda *_: None)
     monkeypatch.setattr("screen_commentator_win.runtime.time.time", lambda: 0.0)
 
     with pytest.raises(RuntimeErrorWithDetails, match="already running"):
-        runtime._verify_daemon_stable(lambda msg: None, key_file)
+        runtime._wait_for_app_local_cli_key(lambda msg: None, key_file)
 
     assert not key_file.exists()
     assert runtime._daemon_process is None
+    assert runtime._daemon_recent_output == []
+
+
+def test_wait_for_app_local_cli_key_times_out_when_daemon_never_becomes_ready(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path))
+    paths = AppPaths.discover()
+    config = AppConfig()
+    runtime = RuntimeManager(paths=paths, config=config)
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"binary")
+
+    class FakeProcess:
+        def poll(self):
+            return 0
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout=None) -> int:
+            return 0
+
+    key_file = tmp_path / "lms-key-2"
+    key_file.write_text("key", encoding="utf-8")
+    runtime._daemon_process = FakeProcess()
+    runtime._daemon_recent_output = ["App is quitting"]
+
+    time_values = iter([0.0, 0.0, 61.0])
+
+    monkeypatch.setattr(runtime, "_daemon_status_command_succeeds", lambda installation: False)
+    monkeypatch.setattr("screen_commentator_win.runtime.time.sleep", lambda *_: None)
+    monkeypatch.setattr("screen_commentator_win.runtime.time.time", lambda: next(time_values))
+
+    with pytest.raises(RuntimeErrorWithDetails, match="Timed out waiting for the isolated llmster daemon"):
+        runtime._wait_for_app_local_cli_key(lambda msg: None, key_file)
+
+    assert not key_file.exists()
+    assert runtime._daemon_process is None
+    assert runtime._daemon_recent_output == []
 
 
 def test_start_daemon_retries_on_singleton_conflict(monkeypatch, tmp_path) -> None:
@@ -540,7 +882,8 @@ def test_download_model_falls_back_to_cli_on_404(monkeypatch, tmp_path) -> None:
 
     assert len(commands) == 1
     assert "get" in commands[0]
-    assert "unsloth/Qwen3.5-4B-GGUF@q4_k_m" in commands[0]
+    assert "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF@q4_k_m" in commands[0]
+    assert "--gguf" in commands[0]
     assert progress[-1] == "Model download completed."
 
 

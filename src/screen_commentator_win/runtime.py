@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Callable
@@ -24,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 INSTALL_SCRIPT_URL = "https://lmstudio.ai/install.ps1"
 DAEMON_START_TIMEOUT_SEC = 60.0
-DAEMON_STABILIZATION_SEC = 3.0
 LOAD_TIMEOUT_SEC = 600.0
 LOAD_ESTIMATE_SEC_PER_GIB = 2.5
 MIN_LOAD_ESTIMATE_SEC = 8.0
@@ -50,6 +50,7 @@ class RuntimeManager:
         self._server_process: subprocess.Popen[str] | None = None
         self._daemon_recent_output: list[str] = []
         self._selected_installation: ResolvedLmStudioPaths | None = None
+        self._active_instance_id: str | None = None
 
     @property
     def base_url(self) -> str:
@@ -60,12 +61,13 @@ class RuntimeManager:
 
     @property
     def lms_executable_path(self) -> str:
-        return str(self._require_installation().lms_executable)
+        installation = self._require_installation()
+        return self._cli_candidates_for_installation(installation)[0]
 
     def create_inference_client(self) -> OpenAICompatibleInferenceClient:
         return OpenAICompatibleInferenceClient(
             base_url=self.base_url,
-            instance_id=self.config.runtime.instance_id,
+            instance_id=self._active_instance_id or self.config.runtime.instance_id,
             timeout_sec=self.config.runtime.request_timeout_sec,
         )
 
@@ -115,6 +117,8 @@ class RuntimeManager:
             progress("Isolated llmster daemon is already running.")
             return
 
+        self._active_instance_id = None
+        self._server_process = None
         self._kill_stale_processes(progress)
 
         try:
@@ -131,15 +135,17 @@ class RuntimeManager:
         self, progress: ProgressCallback, installation: ResolvedLmStudioPaths
     ) -> None:
         key_file = installation.lmstudio_home / ".internal" / "lms-key-2"
+        cli_executable = self._cli_executable_for_installation(installation)
         if key_file.exists():
-            progress(f"Starting llmster daemon via {installation.lms_executable}...")
+            progress(f"Starting llmster daemon via {cli_executable}...")
             completed = self._run_command(
-                [str(installation.lms_executable), "daemon", "up"],
+                [cli_executable, "daemon", "up"],
                 progress=progress,
                 check=False,
                 home_root=installation.home_root,
             )
             if completed.returncode == 0:
+                self._wait_for_app_local_cli_key(progress, key_file=key_file)
                 return
             progress("App-local CLI daemon command failed; restarting the isolated llmster daemon directly.")
             key_file.unlink(missing_ok=True)
@@ -169,19 +175,24 @@ class RuntimeManager:
     def stop_daemon(self, progress: ProgressCallback, ignore_errors: bool = False) -> None:
         installation = self._current_installation()
         if installation is None:
+            self._active_instance_id = None
             return
         progress("Stopping llmster daemon...")
-        key_file = installation.lmstudio_home / ".internal" / "lms-key-2"
-        if key_file.exists():
-            self._run_command(
-                [str(installation.lms_executable), "daemon", "down"],
-                progress=progress,
-                check=not ignore_errors,
-                home_root=installation.home_root,
-            )
+        if self._server_process is not None:
+            self._terminate_process_tree(self._server_process)
+            self._server_process = None
         if self._daemon_process:
-            self._terminate_process(self._daemon_process)
-            self._daemon_process = None
+            self._terminate_process_tree(self._daemon_process)
+        self._daemon_process = None
+        self._kill_matching_llmster_processes(
+            progress,
+            announce=None,
+            skip_if_tracked_running=False,
+        )
+        key_file = installation.lmstudio_home / ".internal" / "lms-key-2"
+        key_file.unlink(missing_ok=True)
+        self._daemon_recent_output = []
+        self._active_instance_id = None
 
     def start_server(self, progress: ProgressCallback) -> None:
         installation = self._current_installation()
@@ -192,35 +203,40 @@ class RuntimeManager:
             self._selected_installation = installation
             progress("llmster server is already running.")
             return
-        if status.get("running"):
-            self._run_command(
-                [str(installation.lms_executable), "server", "stop"],
-                progress=progress,
-                check=False,
-                home_root=installation.home_root,
+        start_errors: list[RuntimeErrorWithDetails] = []
+        for cli_executable in self._cli_candidates_for_installation(installation):
+            progress(
+                f"Starting llmster server on port {self.config.runtime.port} via {cli_executable}..."
             )
+            self._server_process = subprocess.Popen(
+                [cli_executable, "server", "start", "--port", str(self.config.runtime.port)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=self._runtime_environment(home_root=installation.home_root),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            assert self._server_process.stdout is not None
+            threading.Thread(
+                target=self._stream_process_output,
+                args=(self._server_process.stdout, progress),
+                daemon=True,
+            ).start()
+            try:
+                self._wait_for_server(progress, installation=installation, process=self._server_process)
+                return
+            except RuntimeErrorWithDetails as exc:
+                start_errors.append(exc)
+                if self._server_process is not None:
+                    self._terminate_process_tree(self._server_process)
+                self._server_process = None
 
-        progress(
-            f"Starting llmster server on port {self.config.runtime.port} via {installation.lms_executable}..."
-        )
-        self._server_process = subprocess.Popen(
-            [str(installation.lms_executable), "server", "start", "--port", str(self.config.runtime.port)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=self._runtime_environment(home_root=installation.home_root),
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        assert self._server_process.stdout is not None
-        threading.Thread(
-            target=self._stream_process_output,
-            args=(self._server_process.stdout, progress),
-            daemon=True,
-        ).start()
-        self._wait_for_server(progress, installation=installation, process=self._server_process)
+        if start_errors:
+            raise start_errors[-1]
+        raise RuntimeErrorWithDetails("Could not start the llmster server.")
 
     def stop_server(self, progress: ProgressCallback, ignore_errors: bool = False) -> None:
         installation = self._current_installation()
@@ -228,17 +244,9 @@ class RuntimeManager:
             return
 
         progress("Stopping llmster server...")
-        self._run_command(
-            [str(installation.lms_executable), "server", "stop"],
-            progress=progress,
-            check=not ignore_errors,
-        )
         if self._server_process:
-            try:
-                self._server_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self._server_process.terminate()
-            self._server_process = None
+            self._terminate_process_tree(self._server_process)
+        self._server_process = None
 
     def server_status(self) -> dict:
         installation = self._current_installation()
@@ -247,28 +255,63 @@ class RuntimeManager:
         return self._server_status_for_installation(installation)
 
     def _server_status_for_installation(self, installation: ResolvedLmStudioPaths) -> dict:
-        try:
-            completed = subprocess.run(
-                [str(installation.lms_executable), "server", "status", "--json", "--quiet"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=self._runtime_environment(home_root=installation.home_root),
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return {"running": False}
+        if self._server_http_ready():
+            return {"running": True, "port": self.config.runtime.port}
 
-        stdout = completed.stdout.strip()
-        if not stdout:
-            return {"running": False}
+        for cli_executable in self._cli_candidates_for_installation(installation):
+            try:
+                completed = subprocess.run(
+                    [cli_executable, "server", "status", "--json", "--quiet"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=self._runtime_environment(home_root=installation.home_root),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    timeout=10,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+
+            stdout = completed.stdout.strip()
+            if not stdout:
+                continue
+            try:
+                return json.loads(stdout)
+            except json.JSONDecodeError:
+                continue
+        return {"running": False}
+
+    def _server_http_ready(self) -> bool:
         try:
-            return json.loads(stdout)
-        except json.JSONDecodeError:
-            return {"running": False}
+            response = self.http_client.get(
+                f"{self.base_url}/lmstudio-greeting",
+                timeout=5.0,
+            )
+        except httpx.HTTPError:
+            return False
+        return response.status_code == 200
+
+    def _daemon_status_command_succeeds(self, installation: ResolvedLmStudioPaths) -> bool:
+        for cli_executable in self._cli_candidates_for_installation(installation):
+            try:
+                completed = subprocess.run(
+                    [cli_executable, "daemon", "status", "--json"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=self._runtime_environment(home_root=installation.home_root),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    timeout=10,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if completed.returncode == 0:
+                return True
+        return False
 
     def download_model(
         self,
@@ -344,13 +387,13 @@ class RuntimeManager:
         self._report_progress(progress_state, "Queueing model download...", None)
         progress("Queueing model download via llmster CLI...")
         installation = self._require_installation()
-        owner, repo = self._configured_repo_parts()
-        quantization = self.config.runtime.quantization.strip()
-        target = f"{owner}/{repo}@{quantization.lower()}"
+        cli_executable = self._cli_executable_for_installation(installation)
+        target = self._download_request_target()
         command = [
-            str(installation.lms_executable),
+            cli_executable,
             "get",
             target,
+            "--gguf",
             "--yes",
         ]
         progress(f"$ {' '.join(command)}")
@@ -424,59 +467,53 @@ class RuntimeManager:
         self.unload_model(progress, ignore_errors=True)
         model_key = self._resolve_model_key(files)
         progress("Loading multimodal model into memory...")
-        estimated_duration_sec = self._estimated_load_duration_sec(files)
-        installation = self._require_installation()
-        command = [
-            str(installation.lms_executable),
-            "load",
-            model_key,
-            "--context-length",
-            str(self.config.runtime.context_length),
-            "--gpu",
-            self.config.runtime.gpu,
-            "--identifier",
-            self.config.runtime.instance_id,
-            "--yes",
-        ]
-        progress(f"$ {' '.join(command)}")
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=self._runtime_environment(home_root=installation.home_root),
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        self._active_instance_id = None
+        try:
+            response = self.http_client.post(
+                f"{self.base_url}/api/v1/models/load",
+                json={
+                    "model": model_key,
+                    "context_length": self.config.runtime.context_length,
+                },
+                timeout=LOAD_TIMEOUT_SEC,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise RuntimeErrorWithDetails(f"Could not load model: {exc}") from exc
+
+        self._active_instance_id = self._loaded_instance_id_from_response(
+            response.json(),
+            fallback=model_key,
         )
-        if process.stdout is not None:
-            threading.Thread(
-                target=self._stream_process_output,
-                args=(process.stdout, progress),
-                daemon=True,
-            ).start()
-        self._wait_for_model_load(
-            process=process,
-            progress=progress,
-            progress_state=progress_state,
-            estimated_duration_sec=estimated_duration_sec,
-        )
+        progress("Multimodal model is loaded.")
         self._report_progress(progress_state, "Loading multimodal model...", 1.0)
         return files
 
     def unload_model(self, progress: ProgressCallback, ignore_errors: bool = False) -> None:
-        try:
-            self.http_client.post(
-                f"{self.base_url}/api/v1/models/unload",
-                json={"instance_id": self.config.runtime.instance_id},
-                timeout=20.0,
-            ).raise_for_status()
-            progress("Unloaded model from memory.")
-        except httpx.HTTPError as exc:
-            logger.info("Ignoring unload error: %s", exc)
-            if not ignore_errors:
-                raise RuntimeErrorWithDetails(f"Could not unload model: {exc}") from exc
+        instance_ids: list[str] = []
+        for candidate in (self._active_instance_id, self.config.runtime.instance_id):
+            instance_id = str(candidate or "").strip()
+            if instance_id and instance_id not in instance_ids:
+                instance_ids.append(instance_id)
+
+        errors: list[httpx.HTTPError] = []
+        for instance_id in instance_ids:
+            try:
+                self.http_client.post(
+                    f"{self.base_url}/api/v1/models/unload",
+                    json={"instance_id": instance_id},
+                    timeout=20.0,
+                ).raise_for_status()
+                self._active_instance_id = None
+                progress("Unloaded model from memory.")
+                return
+            except httpx.HTTPError as exc:
+                logger.info("Ignoring unload error for %s: %s", instance_id, exc)
+                errors.append(exc)
+
+        self._active_instance_id = None
+        if not ignore_errors and errors:
+            raise RuntimeErrorWithDetails(f"Could not unload model: {errors[-1]}") from errors[-1]
 
     def _run_command(
         self,
@@ -518,57 +555,21 @@ class RuntimeManager:
         resolved_installation = installation or self._require_installation()
         resolved_process = process or self._server_process
         deadline = time.time() + 60.0
+        last_return_code: int | None = None
         while time.time() < deadline:
-            if resolved_process:
-                return_code = resolved_process.poll()
-                if return_code not in (None, 0):
-                    raise RuntimeErrorWithDetails("llmster server process exited before becoming ready.")
-
             status = self._server_status_for_installation(resolved_installation)
             if status.get("running") and int(status.get("port", 0)) == self.config.runtime.port:
                 progress("llmster server is ready.")
                 return
+
+            if resolved_process:
+                return_code = resolved_process.poll()
+                if return_code not in (None, 0):
+                    last_return_code = return_code
             time.sleep(1.0)
+        if last_return_code not in (None, 0):
+            raise RuntimeErrorWithDetails("llmster server process exited before becoming ready.")
         raise RuntimeErrorWithDetails("Timed out waiting for llmster server to start.")
-
-    def _wait_for_model_load(
-        self,
-        process: subprocess.Popen[str],
-        progress: ProgressCallback,
-        progress_state: ProgressStateCallback | None,
-        estimated_duration_sec: float,
-    ) -> None:
-        start = time.monotonic()
-        deadline = start + LOAD_TIMEOUT_SEC
-        while time.monotonic() < deadline:
-            loaded_model = self._loaded_model_entry(self.config.runtime.instance_id)
-            if loaded_model is not None:
-                status = str(loaded_model.get("status", "")).strip().lower()
-                if status not in {"loading", "queued", "unloading"}:
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass
-                    progress("Multimodal model is loaded.")
-                    return
-
-            return_code = process.poll()
-            if return_code not in (None, 0):
-                raise RuntimeErrorWithDetails(
-                    f"llmster load failed with exit code {return_code}."
-                )
-
-            elapsed_sec = max(0.0, time.monotonic() - start)
-            estimated_fraction = min(0.97, elapsed_sec / estimated_duration_sec)
-            self._report_progress(
-                progress_state,
-                "Loading multimodal model... (estimated)",
-                estimated_fraction,
-            )
-            time.sleep(1.0)
-
-        self._terminate_process(process)
-        raise RuntimeErrorWithDetails("Timed out waiting for the multimodal model to load.")
 
     def _runtime_environment(self, home_root=None) -> dict[str, str]:
         env = os.environ.copy()
@@ -608,21 +609,25 @@ class RuntimeManager:
         return files.main_file.stem.lower()
 
     def _list_available_models(self) -> list[dict]:
-        payload = self._run_json_command(
-            [self.lms_executable_path, "ls", "--json"],
-            timeout=20,
-        )
-        if isinstance(payload, list):
-            return [item for item in payload if isinstance(item, dict)]
+        installation = self._require_installation()
+        for cli_executable in self._cli_candidates_for_installation(installation):
+            payload = self._run_json_command(
+                [cli_executable, "ls", "--json"],
+                timeout=20,
+            )
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
         return []
 
     def _list_loaded_models(self) -> list[dict]:
-        payload = self._run_json_command(
-            [self.lms_executable_path, "ps", "--json"],
-            timeout=20,
-        )
-        if isinstance(payload, list):
-            return [item for item in payload if isinstance(item, dict)]
+        installation = self._require_installation()
+        for cli_executable in self._cli_candidates_for_installation(installation):
+            payload = self._run_json_command(
+                [cli_executable, "ps", "--json"],
+                timeout=20,
+            )
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
         return []
 
     def _loaded_model_entry(self, identifier: str) -> dict | None:
@@ -689,6 +694,15 @@ class RuntimeManager:
             progress_state(label, fraction)
 
     @staticmethod
+    def _loaded_instance_id_from_response(payload: object, *, fallback: str) -> str:
+        if isinstance(payload, dict):
+            for key in ("instance_id", "instanceId", "identifier", "id"):
+                value = str(payload.get(key, "")).strip()
+                if value:
+                    return value
+        return fallback
+
+    @staticmethod
     def _stream_process_output(
         handle,
         progress: ProgressCallback,
@@ -718,6 +732,22 @@ class RuntimeManager:
         except subprocess.TimeoutExpired:
             process.kill()
 
+    def _terminate_process_tree(self, process: subprocess.Popen[str]) -> None:
+        pid = getattr(process, "pid", None)
+        if pid and process.poll() is None:
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                return
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        self._terminate_process(process)
+
     def _app_local_daemon_executable(self) -> str:
         if self.paths.llmster_install_location_file.exists():
             try:
@@ -744,6 +774,26 @@ class RuntimeManager:
         raise RuntimeErrorWithDetails(
             "llmster is not installed correctly in the app-local runtime directory."
         )
+
+    def _cli_executable_for_installation(self, installation: ResolvedLmStudioPaths) -> str:
+        return self._cli_candidates_for_installation(installation)[0]
+
+    def _cli_candidates_for_installation(self, installation: ResolvedLmStudioPaths) -> list[str]:
+        try:
+            daemon_executable = self._app_local_daemon_executable()
+        except RuntimeErrorWithDetails:
+            daemon_executable = ""
+
+        candidates: list[str] = []
+        if daemon_executable:
+            bundled_lms = os.path.join(os.path.dirname(daemon_executable), ".bundle", "lms.exe")
+            if os.path.exists(bundled_lms):
+                candidates.append(bundled_lms)
+
+        installation_lms = str(installation.lms_executable)
+        if installation_lms not in candidates:
+            candidates.append(installation_lms)
+        return candidates
 
     def _downloaded_model_dir(self, search_root):
         owner, repo = self._configured_repo_parts()
@@ -779,6 +829,16 @@ class RuntimeManager:
                 "runtime.model_repo_url must point to a Hugging Face repository like owner/repo."
             )
         return parts[0], parts[1]
+
+    def _download_request_target(self) -> str:
+        raw = self.config.runtime.model_repo_url.strip().rstrip("/")
+        if not raw:
+            raise RuntimeErrorWithDetails("runtime.model_repo_url must not be empty.")
+
+        quantization = self.config.runtime.quantization.strip()
+        if not quantization:
+            raise RuntimeErrorWithDetails("runtime.quantization must not be empty.")
+        return f"{raw}@{quantization.lower()}"
 
     def _find_main_model_file(self, repo_root):
         quantization_suffix = f"-{self.config.runtime.quantization}.gguf".lower()
@@ -817,68 +877,133 @@ class RuntimeManager:
         return candidates[0]
 
     def _kill_stale_processes(self, progress: ProgressCallback) -> None:
-        """Kill every process whose executable lives under llmster-home."""
-        if self._daemon_process and self._daemon_process.poll() is None:
-            return
-
-        home = str(self.paths.llmster_home).replace("'", "''")
-        progress("Cleaning up stale llmster processes...")
-        try:
-            subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-Command",
-                    (
-                        "Get-Process -ErrorAction SilentlyContinue "
-                        f"| Where-Object {{ $_.Path -like '{home}*' }} "
-                        "| Stop-Process -Force"
-                    ),
-                ],
-                capture_output=True,
-                timeout=15,
-                check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        self._kill_matching_llmster_processes(
+            progress,
+            announce="Cleaning up stale llmster processes...",
+            skip_if_tracked_running=True,
+        )
 
         installation = self._current_installation()
         if installation is not None:
             key_file = installation.lmstudio_home / ".internal" / "lms-key-2"
             key_file.unlink(missing_ok=True)
 
-    def _wait_for_app_local_cli_key(self, progress: ProgressCallback, key_file) -> None:
-        deadline = time.time() + DAEMON_START_TIMEOUT_SEC
-        while time.time() < deadline:
-            if key_file.exists():
-                self._verify_daemon_stable(progress, key_file)
-                progress("Isolated llmster daemon is ready.")
-                return
-
-            if self._daemon_process:
-                return_code = self._daemon_process.poll()
-                if return_code is not None:
-                    message = self._daemon_start_failure_message(return_code)
-                    self._daemon_process = None
-                    raise RuntimeErrorWithDetails(message)
-
-            time.sleep(0.5)
-        raise RuntimeErrorWithDetails("Timed out waiting for the isolated llmster daemon to initialize.")
-
-    def _verify_daemon_stable(self, progress: ProgressCallback, key_file) -> None:
-        if not self._daemon_process:
+    def _kill_matching_llmster_processes(
+        self,
+        progress: ProgressCallback,
+        *,
+        announce: str | None,
+        skip_if_tracked_running: bool,
+    ) -> None:
+        if skip_if_tracked_running and self._daemon_process and self._daemon_process.poll() is None:
             return
 
-        deadline = time.time() + DAEMON_STABILIZATION_SEC
-        while time.time() < deadline:
-            return_code = self._daemon_process.poll()
-            if return_code is not None:
-                key_file.unlink(missing_ok=True)
-                message = self._daemon_start_failure_message(return_code)
-                self._daemon_process = None
-                raise RuntimeErrorWithDetails(message)
-            time.sleep(0.5)
+        if announce:
+            progress(announce)
+
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    (
+                        "Get-Process -Name llmster -ErrorAction SilentlyContinue "
+                        "| Select-Object -Property Id, ProcessName, Path "
+                        "| ConvertTo-Json -Compress"
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return
+
+        stdout = result.stdout.strip()
+        if not stdout:
+            return
+
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            payload = []
+
+        if isinstance(payload, dict):
+            payload = [payload]
+
+        for entry in payload:
+            pid = entry.get("Id")
+            executable_path = str(entry.get("Path", "")).strip()
+            if not pid or not self._is_stale_llmster_process_path(executable_path):
+                continue
+            progress(f"Terminating stale llmster process tree (PID {pid})...")
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+    def _wait_for_app_local_cli_key(self, progress: ProgressCallback, key_file) -> None:
+        installation = self._require_installation()
+        deadline = time.time() + DAEMON_START_TIMEOUT_SEC
+        try:
+            while time.time() < deadline:
+                if self._daemon_status_command_succeeds(installation):
+                    if self._daemon_process and self._daemon_process.poll() is not None:
+                        self._daemon_process = None
+                    progress("Isolated llmster daemon is ready.")
+                    return
+
+                if self._daemon_process:
+                    return_code = self._daemon_process.poll()
+                    if return_code not in (None, 0):
+                        raise RuntimeErrorWithDetails(
+                            self._daemon_start_failure_message(return_code)
+                        )
+
+                time.sleep(0.5)
+        except Exception:
+            self._cleanup_failed_daemon_start(key_file)
+            raise
+        self._cleanup_failed_daemon_start(key_file)
+        raise RuntimeErrorWithDetails("Timed out waiting for the isolated llmster daemon to initialize.")
+
+    def _cleanup_failed_daemon_start(self, key_file) -> None:
+        key_file.unlink(missing_ok=True)
+        if self._daemon_process is not None:
+            self._terminate_process(self._daemon_process)
+        self._daemon_process = None
+        self._daemon_recent_output = []
+        self._active_instance_id = None
+
+    def _is_stale_llmster_process_path(self, executable_path: str) -> bool:
+        if not executable_path:
+            return False
+
+        normalized_path = os.path.normcase(os.path.normpath(executable_path))
+        if os.path.basename(normalized_path) != "llmster.exe":
+            return False
+
+        app_local_root = os.path.normcase(os.path.normpath(str(self.paths.llmster_home)))
+        if normalized_path.startswith(app_local_root + os.sep):
+            return True
+
+        legacy_temp_prefix = os.path.normcase(
+            os.path.normpath(os.path.join(tempfile.gettempdir(), "scw-llmster-direct-"))
+        )
+        return normalized_path.startswith(legacy_temp_prefix) and (
+            f"{os.sep}llmster-home{os.sep}" in normalized_path
+        )
 
     def _daemon_start_failure_message(self, return_code: int) -> str:
         recent_output = "\n".join(self._daemon_recent_output[-8:])
