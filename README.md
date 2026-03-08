@@ -122,13 +122,19 @@ quantization = "Q4_K_M"
 ## Third-Party Software, Model Licenses, And Disclaimer
 
 - この repository のコード自体は [MIT](./LICENSE) です。
+- この repository は、第三者ソフトウェアや第三者配布モデルのライセンスまで再許諾するものではありません。
 - `llmster` / LM Studio は別ソフトウェアです。利用時はそれぞれの利用条件に従ってください。
   - LM Studio Terms: [https://lmstudio.ai/terms](https://lmstudio.ai/terms)
 - 既定モデルは Hugging Face の [unsloth/Qwen3.5-4B-GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) を参照します。
   - 2026-03-08 時点の Hugging Face 表記では `apache-2.0` です。
 - モデルを差し替える場合、その weights / GGUF / mmproj のライセンス確認は利用者側で行ってください。
+- Python 依存ライブラリもそれぞれ独自のライセンスで提供されています。
+  - 例: `httpx`, `mss`, `Pillow`, `PySide6`, `tomli-w`, 開発時の `PyInstaller`, `pytest`, `pytest-qt`
+- release 物やローカル `.venv` に含まれる依存ライブラリについても、それぞれの upstream license が優先されます。
+- 必要なら `pyproject.toml` を見て依存一覧を確認し、各 upstream project の license を追ってください。
 - この fork は個人の趣味・検証用途を想定しています。
 - 生成結果の内容、正確性、安全性、適法性について作者は保証しません。利用と生成物の扱いは各利用者の責任で行ってください。
+- 第三者ソフトウェア、依存ライブラリ、モデルの利用条件に反する使い方について、作者は責任を負いません。
 
 ## License
 
