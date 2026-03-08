@@ -115,24 +115,17 @@ class RuntimeManager:
             progress("Isolated llmster daemon is already running.")
             return
 
-        self._kill_stale_daemons(progress)
+        self._kill_stale_processes(progress)
 
-        last_error: RuntimeErrorWithDetails | None = None
-        for attempt in range(3):
-            try:
-                self._attempt_daemon_start(progress, installation)
-                return
-            except RuntimeErrorWithDetails as exc:
-                last_error = exc
-                if attempt < 2 and "already running" in str(exc).lower():
-                    progress("Detected another llmster instance; retrying after cleanup...")
-                    self._kill_stale_daemons(progress)
-                    time.sleep(3.0)
-                    continue
+        try:
+            self._attempt_daemon_start(progress, installation)
+        except RuntimeErrorWithDetails as exc:
+            if "already running" not in str(exc).lower():
                 raise
-
-        assert last_error is not None
-        raise last_error
+            progress("Retrying after killing remaining processes...")
+            self._kill_stale_processes(progress)
+            time.sleep(3.0)
+            self._attempt_daemon_start(progress, installation)
 
     def _attempt_daemon_start(
         self, progress: ProgressCallback, installation: ResolvedLmStudioPaths
@@ -823,88 +816,34 @@ class RuntimeManager:
         candidates.sort(key=lambda path: (len(path.parts), len(path.name)))
         return candidates[0]
 
-    def _kill_stale_daemons(self, progress: ProgressCallback) -> None:
+    def _kill_stale_processes(self, progress: ProgressCallback) -> None:
+        """Kill every process whose executable lives under llmster-home."""
         if self._daemon_process and self._daemon_process.poll() is None:
             return
 
-        installation = self._current_installation()
-
-        # 1. Graceful shutdown via CLI — this cleanly stops child processes too.
-        if installation is not None:
-            key_file = installation.lmstudio_home / ".internal" / "lms-key-2"
-            if key_file.exists():
-                progress("Stopping existing llmster daemon via CLI...")
-                try:
-                    subprocess.run(
-                        [str(installation.lms_executable), "daemon", "down"],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=15,
-                        check=False,
-                        env=self._runtime_environment(home_root=installation.home_root),
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    )
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
-                time.sleep(1.0)
-
-        # 2. Force-kill remaining app-local llmster processes (with /T for tree kill).
+        home = str(self.paths.llmster_home).replace("'", "''")
+        progress("Cleaning up stale llmster processes...")
         try:
-            result = subprocess.run(
+            subprocess.run(
                 [
                     "powershell",
                     "-NoProfile",
                     "-Command",
                     (
-                        "Get-Process -Name llmster -ErrorAction SilentlyContinue "
-                        "| Select-Object -Property Id, Path "
-                        "| ConvertTo-Json -Compress"
+                        "Get-Process -ErrorAction SilentlyContinue "
+                        f"| Where-Object {{ $_.Path -like '{home}*' }} "
+                        "| Stop-Process -Force"
                     ),
                 ],
                 capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10,
+                timeout=15,
                 check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except (OSError, subprocess.TimeoutExpired):
-            result = None
+            pass
 
-        if result is not None:
-            stdout = result.stdout.strip()
-            if stdout:
-                try:
-                    payload = json.loads(stdout)
-                except json.JSONDecodeError:
-                    payload = []
-
-                if isinstance(payload, dict):
-                    payload = [payload]
-
-                app_local_prefix = str(self.paths.llmster_home).lower()
-                for entry in payload:
-                    exe_path = str(entry.get("Path", "")).lower()
-                    pid = entry.get("Id")
-                    if not pid:
-                        continue
-                    if exe_path.startswith(app_local_prefix):
-                        progress(f"Terminating stale llmster process tree (PID {pid})...")
-                        try:
-                            subprocess.run(
-                                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                                capture_output=True,
-                                timeout=10,
-                                check=False,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                            )
-                        except (OSError, subprocess.TimeoutExpired):
-                            pass
-
-        # 3. Clean up key file.
+        installation = self._current_installation()
         if installation is not None:
             key_file = installation.lmstudio_home / ".internal" / "lms-key-2"
             key_file.unlink(missing_ok=True)
