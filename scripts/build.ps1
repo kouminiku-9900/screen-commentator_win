@@ -13,6 +13,7 @@ $releaseRoot = Join-Path $workspace "release"
 $artifactDir = Join-Path $releaseRoot "ScreenCommentatorLauncher"
 $zipPath = Join-Path $releaseRoot "ScreenCommentatorLauncher-win64.zip"
 $demoOverlayPath = Join-Path $releaseRoot "demo-overlay.png"
+$licenseDir = Join-Path $artifactDir "licenses"
 
 function Remove-PathWithRetry {
     param(
@@ -62,6 +63,61 @@ function Compress-ArchiveWithRetry {
     }
 }
 
+function Copy-LicenseArtifacts {
+    param(
+        [string]$ArtifactDir,
+        [string]$Workspace
+    )
+
+    New-Item -ItemType Directory -Path $ArtifactDir -Force | Out-Null
+    $licenseDir = Join-Path $ArtifactDir "licenses"
+    New-Item -ItemType Directory -Path $licenseDir -Force | Out-Null
+
+    foreach ($name in @("LICENSE", "README.md", "THIRD_PARTY_NOTICES.md")) {
+        $sourcePath = Join-Path $Workspace $name
+        if (Test-Path $sourcePath) {
+            Copy-Item -Path $sourcePath -Destination (Join-Path $ArtifactDir $name) -Force
+        }
+    }
+
+    $licenseSources = @(
+        @{ Name = "httpx"; Pattern = ".venv\Lib\site-packages\httpx-*.dist-info\licenses" },
+        @{ Name = "mss"; Pattern = ".venv\Lib\site-packages\mss-*.dist-info\licenses" },
+        @{ Name = "pillow"; Pattern = ".venv\Lib\site-packages\pillow-*.dist-info\licenses" },
+        @{ Name = "pyside6"; Pattern = ".venv\Lib\site-packages\pyside6-*.dist-info\licenses" },
+        @{ Name = "pyside6-essentials"; Pattern = ".venv\Lib\site-packages\pyside6_essentials-*.dist-info\licenses" },
+        @{ Name = "pyside6-addons"; Pattern = ".venv\Lib\site-packages\pyside6_addons-*.dist-info\licenses" },
+        @{ Name = "shiboken6"; Pattern = ".venv\Lib\site-packages\shiboken6-*.dist-info\licenses" },
+        @{ Name = "tomli-w"; Pattern = ".venv\Lib\site-packages\tomli_w-*.dist-info\LICENSE" },
+        @{ Name = "pyinstaller"; Pattern = ".venv\Lib\site-packages\pyinstaller-*.dist-info\licenses" }
+    )
+
+    foreach ($entry in $licenseSources) {
+        $matches = Get-ChildItem -Path (Join-Path $Workspace $entry.Pattern) -ErrorAction SilentlyContinue
+        if (-not $matches) {
+            continue
+        }
+
+        $sourcePath = $matches[0].FullName
+        if (-not (Test-Path $sourcePath)) {
+            continue
+        }
+
+        $destinationPath = Join-Path $licenseDir $entry.Name
+        if (Test-Path $destinationPath) {
+            Remove-Item -Recurse -Force $destinationPath
+        }
+
+        if ((Get-Item $sourcePath) -is [System.IO.DirectoryInfo]) {
+            Copy-Item -Path $sourcePath -Destination $destinationPath -Recurse -Force
+        }
+        else {
+            New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
+            Copy-Item -Path $sourcePath -Destination (Join-Path $destinationPath (Split-Path $sourcePath -Leaf)) -Force
+        }
+    }
+}
+
 Remove-PathWithRetry -Path (Join-Path $workspace "build") -Required $false
 Remove-PathWithRetry -Path (Join-Path $workspace "dist") -Required $false
 Remove-PathWithRetry -Path $releaseRoot -Required $true
@@ -88,6 +144,8 @@ $exePath = Join-Path $artifactDir "ScreenCommentatorLauncher.exe"
 if (-not (Test-Path $exePath)) {
     throw "Packaged executable was not generated."
 }
+
+Copy-LicenseArtifacts -ArtifactDir $artifactDir -Workspace $workspace
 
 $previousQtPlatform = $env:QT_QPA_PLATFORM
 try {

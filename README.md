@@ -70,6 +70,15 @@ pwsh -File .\scripts\build.ps1
 
 ビルド時には packaged exe に対して self-test を実行し、overlay PNG まで確認します。
 
+## Publication Policy
+
+この repository で公開対象として想定しているのは source code です。  
+`release/` の exe や zip はローカル build 成果物であり、この repository の公式バイナリ配布物という位置づけにはしません。
+
+- git には `llmster` 本体を含めません
+- git にはモデル weights / GGUF / `mmproj` を含めません
+- 公開時は source repo のみを基本とし、ローカルで作ったバイナリを第三者へ再配布する場合は利用者自身が第三者ライセンス条件を確認してください
+
 ## Install And First Run
 
 GitHub から取得して使う前提なら、最短手順はこれです。
@@ -132,6 +141,7 @@ quantization = "Q4_K_M"
   - 例: `httpx`, `mss`, `Pillow`, `PySide6`, `tomli-w`, 開発時の `PyInstaller`, `pytest`, `pytest-qt`
 - release 物やローカル `.venv` に含まれる依存ライブラリについても、それぞれの upstream license が優先されます。
 - 必要なら `pyproject.toml` を見て依存一覧を確認し、各 upstream project の license を追ってください。
+- 依存関係の整理と source-only 公開方針については [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) も参照してください。
 - この fork は個人の趣味・検証用途を想定しています。
 - 生成結果の内容、正確性、安全性、適法性について作者は保証しません。利用と生成物の扱いは各利用者の責任で行ってください。
 - 第三者ソフトウェア、依存ライブラリ、モデルの利用条件に反する使い方について、作者は責任を負いません。
