@@ -13,44 +13,62 @@ from screen_commentator_win.runtime import RuntimeErrorWithDetails
 from screen_commentator_win.runtime import RuntimeManager
 
 
-def test_download_model_polls_until_completion(monkeypatch, tmp_path) -> None:
+def test_download_model_uses_cli_and_reports_progress(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path))
     paths = AppPaths.discover()
     config = AppConfig()
     progress: list[str] = []
-    seen_requests: list[tuple[str, dict[str, object]]] = []
-    polls = iter(
+    progress_state: list[tuple[str, float | None]] = []
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"binary")
+    runtime = RuntimeManager(paths=paths, config=config)
+    commands: list[list[str]] = []
+
+    class FakeProcess:
+        def __init__(self, command, **kwargs) -> None:
+            commands.append(command)
+            self.stdout = iter(
+                [
+                    "Resolving model...\n",
+                    "Downloading model... 25.0%\n",
+                    "Downloading model... 100.0%\n",
+                ]
+            )
+
+        def poll(self):
+            return 0
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout=None) -> int:
+            return 0
+
+    monkeypatch.setattr("screen_commentator_win.runtime.subprocess.Popen", FakeProcess)
+    monkeypatch.setattr(
+        runtime,
+        "verify_model_files",
+        lambda: ModelFiles(main_file=tmp_path / "main.gguf", mmproj_file=tmp_path / "mmproj.gguf"),
+    )
+
+    runtime.download_model(progress.append, lambda label, fraction: progress_state.append((label, fraction)))
+
+    assert commands == [
         [
-            {"status": "downloading", "downloaded_bytes": 50, "total_size_bytes": 100},
-            {"status": "completed", "downloaded_bytes": 100, "total_size_bytes": 100},
+            str(paths.lms_executable),
+            "get",
+            "unsloth/Qwen3.5-4B-GGUF@q4_k_m",
+            "--gguf",
+            "--yes",
         ]
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST":
-            seen_requests.append((str(request.url), json.loads(request.content.decode("utf-8"))))
-            return httpx.Response(200, json={"status": "queued", "job_id": "job-1"})
-        return httpx.Response(200, json=next(polls))
-
-    monkeypatch.setattr("screen_commentator_win.runtime.time.sleep", lambda *_: None)
-    runtime = RuntimeManager(
-        paths=paths,
-        config=config,
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-
-    runtime.download_model(progress.append)
-
-    assert seen_requests == [
-        (
-            "http://127.0.0.1:12346/api/v1/models/download",
-            {
-                "model": config.runtime.model_repo_url,
-                "quantization": config.runtime.quantization,
-            },
-        )
     ]
     assert progress[-1] == "Model download completed."
+    assert progress_state == [
+        ("Queueing model download...", None),
+        ("Downloading model...", 0.25),
+        ("Downloading model...", 1.0),
+        ("Model download completed.", 1.0),
+    ]
 
 
 def test_install_llmster_requires_app_local_install(monkeypatch, tmp_path) -> None:
