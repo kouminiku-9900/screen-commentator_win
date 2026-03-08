@@ -64,6 +64,11 @@ If you locally build a Windows executable, your output may contain third-party b
 - If you redistribute a local build, include the relevant license texts and notices for bundled dependencies.
 - This repository makes no claim that a user-built binary is automatically cleared for redistribution in every jurisdiction or use case.
 
+## Trademarks
+
+本リポジトリ内で言及される製品名、サービス名、企業名等は、それぞれの所有者の商標または登録商標です。
+本プロジェクトはこれらの商標権者との提携・推奨関係を示すものではありません。
+
 ## Disclaimer
 
 - This project is intended for personal, hobby, and evaluation use.
