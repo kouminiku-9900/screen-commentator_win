@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import subprocess
 
 import pytest
 from PIL import Image
@@ -35,10 +36,31 @@ def _fixture_frame() -> CapturedFrame:
     )
 
 
+def _lm_studio_desktop_is_running() -> bool:
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "$p = Get-Process -Name 'LM Studio' -ErrorAction SilentlyContinue; "
+            "if ($p) { 'running' }",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+        check=False,
+    )
+    return "running" in completed.stdout
+
+
 @pytest.mark.real_runtime
 def test_real_runtime_generates_overlay_comment(qtbot, tmp_path, monkeypatch) -> None:
     if os.environ.get("SCW_RUN_REAL_E2E") != "1":
         pytest.skip("Set SCW_RUN_REAL_E2E=1 to run the llmster/model end-to-end test.")
+    if _lm_studio_desktop_is_running():
+        pytest.skip("Close LM Studio first. The real-runtime test requires the isolated app-local llmster.")
 
     monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path / "app-root"))
     paths = AppPaths.discover()

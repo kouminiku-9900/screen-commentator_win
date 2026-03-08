@@ -98,7 +98,23 @@ class FakeEngine:
 
 
 def _build_controller_bundle(tmp_path):
-    paths = AppPaths(root=tmp_path, config_file=tmp_path / "config.toml", logs_dir=tmp_path / "logs", state_dir=tmp_path / "state", llmster_home=tmp_path / "llmster-home", llmstudio_home=tmp_path / "llmster-home" / ".lmstudio", llmstudio_bin_dir=tmp_path / "llmster-home" / ".lmstudio" / "bin", lms_executable=tmp_path / "llmster-home" / ".lmstudio" / "bin" / "lms.exe", install_script_cache=tmp_path / "state" / "install-llmster.ps1", app_log_file=tmp_path / "logs" / "screen-commentator.log")
+    paths = AppPaths(
+        root=tmp_path,
+        config_file=tmp_path / "config.toml",
+        logs_dir=tmp_path / "logs",
+        state_dir=tmp_path / "state",
+        llmster_home=tmp_path / "llmster-home",
+        llmstudio_home=tmp_path / "llmster-home" / ".lmstudio",
+        llmstudio_bin_dir=tmp_path / "llmster-home" / ".lmstudio" / "bin",
+        lms_executable=tmp_path / "llmster-home" / ".lmstudio" / "bin" / "lms.exe",
+        llmster_install_location_file=tmp_path
+        / "llmster-home"
+        / ".lmstudio"
+        / ".internal"
+        / "llmster-install-location.json",
+        install_script_cache=tmp_path / "state" / "install-llmster.ps1",
+        app_log_file=tmp_path / "logs" / "screen-commentator.log",
+    )
     paths.ensure_directories()
     config_manager = ConfigManager(paths)
     config = AppConfig()

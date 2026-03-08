@@ -4,8 +4,10 @@ import json
 import subprocess
 
 import httpx
+import pytest
 
 from screen_commentator_win.models import AppConfig
+from screen_commentator_win.models import ModelFiles
 from screen_commentator_win.paths import AppPaths
 from screen_commentator_win.runtime import RuntimeErrorWithDetails
 from screen_commentator_win.runtime import RuntimeManager
@@ -51,16 +53,11 @@ def test_download_model_polls_until_completion(monkeypatch, tmp_path) -> None:
     assert progress[-1] == "Model download completed."
 
 
-def test_install_llmster_detects_global_install_when_bootstrap_ignores_app_home(
-    monkeypatch,
-    tmp_path,
-) -> None:
+def test_install_llmster_requires_app_local_install(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path / "app-root"))
-    monkeypatch.setattr("screen_commentator_win.paths.actual_user_home", lambda: tmp_path / "user-home")
     paths = AppPaths.discover()
     config = AppConfig()
     progress: list[str] = []
-    progress_state: list[tuple[str, float | None]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text="installer")
@@ -72,94 +69,124 @@ def test_install_llmster_detects_global_install_when_bootstrap_ignores_app_home(
     )
 
     def fake_run_command(command, progress, check, home_root=None):
-        global_lms = tmp_path / "user-home" / ".lmstudio" / "bin"
-        global_lms.mkdir(parents=True, exist_ok=True)
-        (global_lms / "lms.exe").write_bytes(b"binary")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(runtime, "_run_command", fake_run_command)
 
-    runtime.install_llmster(progress.append, lambda label, fraction: progress_state.append((label, fraction)))
-
-    installation = paths.resolve_installation()
-    assert installation is not None
-    assert installation.lms_executable == tmp_path / "user-home" / ".lmstudio" / "bin" / "lms.exe"
-    assert ("llmster installed.", 1.0) in progress_state
-    assert any("ignored the requested app-local home" in line for line in progress)
+    with pytest.raises(RuntimeErrorWithDetails, match="app-local runtime directory"):
+        runtime.install_llmster(progress.append)
 
 
-def test_runtime_environment_uses_resolved_home_root(monkeypatch, tmp_path) -> None:
+def test_runtime_environment_uses_app_local_home_root(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path / "app-root"))
-    monkeypatch.setattr("screen_commentator_win.paths.actual_user_home", lambda: tmp_path / "user-home")
     paths = AppPaths.discover()
     config = AppConfig()
-    global_lms = tmp_path / "user-home" / ".lmstudio" / "bin"
-    global_lms.mkdir(parents=True, exist_ok=True)
-    (global_lms / "lms.exe").write_bytes(b"binary")
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"binary")
 
     runtime = RuntimeManager(paths=paths, config=config)
     env = runtime._runtime_environment()
 
-    assert env["HOME"] == str(tmp_path / "user-home")
-    assert env["USERPROFILE"] == str(tmp_path / "user-home")
+    assert env["HOME"] == str(paths.llmster_home)
+    assert env["USERPROFILE"] == str(paths.llmster_home)
     assert env["LMS_NO_MODIFY_PATH"] == "1"
 
 
-def test_start_daemon_falls_back_to_user_home_install(monkeypatch, tmp_path) -> None:
+def test_start_daemon_launches_app_local_llmster_when_key_missing(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path / "app-root"))
-    monkeypatch.setattr("screen_commentator_win.paths.actual_user_home", lambda: tmp_path / "user-home")
-    paths = AppPaths.discover()
-    config = AppConfig()
-    local_lms = paths.llmstudio_bin_dir
-    local_lms.mkdir(parents=True, exist_ok=True)
-    (local_lms / "lms.exe").write_bytes(b"local")
-    user_lms = tmp_path / "user-home" / ".lmstudio" / "bin"
-    user_lms.mkdir(parents=True, exist_ok=True)
-    (user_lms / "lms.exe").write_bytes(b"user")
-    progress: list[str] = []
-
-    runtime = RuntimeManager(paths=paths, config=config)
-
-    def fake_run_command(command, progress, check, home_root=None):
-        executable = command[0]
-        if executable == str(local_lms / "lms.exe"):
-            return subprocess.CompletedProcess(command, 1, "", "invalid passkey")
-        return subprocess.CompletedProcess(command, 0, "", "")
-
-    monkeypatch.setattr(runtime, "_run_command", fake_run_command)
-
-    runtime.start_daemon(progress.append)
-
-    assert runtime.lms_executable_path == str(user_lms / "lms.exe")
-    assert any("trying another installation" in line for line in progress)
-
-
-def test_start_daemon_copies_global_cli_key_for_app_local_runtime(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path / "app-root"))
-    monkeypatch.setattr("screen_commentator_win.paths.actual_user_home", lambda: tmp_path / "user-home")
     paths = AppPaths.discover()
     config = AppConfig()
     progress: list[str] = []
-    local_lms = paths.llmstudio_bin_dir
-    local_lms.mkdir(parents=True, exist_ok=True)
-    (local_lms / "lms.exe").write_bytes(b"local")
-    source_key = tmp_path / "user-home" / ".lmstudio" / ".internal" / "lms-key-2"
-    source_key.parent.mkdir(parents=True, exist_ok=True)
-    source_key.write_text("shared-key", encoding="utf-8")
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"local")
+    daemon_executable = paths.llmstudio_home / "llmster" / "0.0.6-1" / "llmster.exe"
+    daemon_executable.parent.mkdir(parents=True, exist_ok=True)
+    daemon_executable.write_bytes(b"daemon")
+    paths.llmster_install_location_file.parent.mkdir(parents=True, exist_ok=True)
+    paths.llmster_install_location_file.write_text(
+        json.dumps({"path": str(daemon_executable)}),
+        encoding="utf-8",
+    )
 
     runtime = RuntimeManager(paths=paths, config=config)
+    captured: dict[str, object] = {}
 
-    def fake_run_command(command, progress, check, home_root=None):
-        copied_key = paths.llmstudio_home / ".internal" / "lms-key-2"
-        assert copied_key.read_text(encoding="utf-8") == "shared-key"
-        return subprocess.CompletedProcess(command, 0, "", "")
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = []
 
-    monkeypatch.setattr(runtime, "_run_command", fake_run_command)
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout=None) -> int:
+            return 0
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return FakeProcess()
+
+    def fake_wait_for_key(progress_callback, key_file):
+        key_file.parent.mkdir(parents=True, exist_ok=True)
+        key_file.write_text("ready", encoding="utf-8")
+        progress_callback("Isolated llmster daemon is ready.")
+
+    monkeypatch.setattr("screen_commentator_win.runtime.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(runtime, "_wait_for_app_local_cli_key", fake_wait_for_key)
 
     runtime.start_daemon(progress.append)
 
-    assert (paths.llmstudio_home / ".internal" / "lms-key-2").exists()
-    assert any("Copied LM Studio CLI key" in line for line in progress)
+    assert captured["command"] == [str(daemon_executable)]
+    assert captured["env"]["HOME"] == str(paths.llmster_home)
+    assert captured["env"]["USERPROFILE"] == str(paths.llmster_home)
+    assert progress[-1] == "Isolated llmster daemon is ready."
+
+
+def test_start_daemon_reports_running_lm_studio_conflict(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path / "app-root"))
+    paths = AppPaths.discover()
+    config = AppConfig()
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"local")
+    daemon_executable = paths.llmstudio_home / "llmster" / "0.0.6-1" / "llmster.exe"
+    daemon_executable.parent.mkdir(parents=True, exist_ok=True)
+    daemon_executable.write_bytes(b"daemon")
+
+    runtime = RuntimeManager(paths=paths, config=config)
+    paths.llmster_install_location_file.parent.mkdir(parents=True, exist_ok=True)
+    paths.llmster_install_location_file.write_text(
+        json.dumps({"path": str(daemon_executable)}),
+        encoding="utf-8",
+    )
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = []
+
+        def poll(self):
+            return 1
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout=None) -> int:
+            return 1
+
+    def fake_popen(command, **kwargs):
+        runtime._daemon_recent_output = [
+            "Cannot start: LM Studio is already running with built-in llmster. "
+            "Close LM Studio first, or use LM Studio instead of standalone llmster."
+        ]
+        return FakeProcess()
+
+    monkeypatch.setattr("screen_commentator_win.runtime.subprocess.Popen", fake_popen)
+    progress: list[str] = []
+
+    with pytest.raises(RuntimeErrorWithDetails, match="Close LM Studio completely and try again"):
+        runtime.start_daemon(progress.append)
 
 
 def test_wait_for_server_accepts_successful_launcher_exit(monkeypatch, tmp_path) -> None:
@@ -168,9 +195,8 @@ def test_wait_for_server_accepts_successful_launcher_exit(monkeypatch, tmp_path)
     config = AppConfig()
     runtime = RuntimeManager(paths=paths, config=config)
     progress: list[str] = []
-    lms_dir = paths.llmstudio_bin_dir
-    lms_dir.mkdir(parents=True, exist_ok=True)
-    (lms_dir / "lms.exe").write_bytes(b"binary")
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"binary")
     statuses = iter(
         [
             {"running": False},
@@ -191,13 +217,65 @@ def test_wait_for_server_accepts_successful_launcher_exit(monkeypatch, tmp_path)
     assert progress[-1] == "llmster server is ready."
 
 
+def test_start_server_uses_app_local_installation(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path / "app-root"))
+    paths = AppPaths.discover()
+    config = AppConfig()
+    progress: list[str] = []
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"local")
+
+    runtime = RuntimeManager(paths=paths, config=config)
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = []
+
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout=None) -> int:
+            return 0
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return FakeProcess()
+
+    def fake_wait_for_server(progress_callback, installation=None, process=None):
+        captured["installation"] = installation
+        captured["process"] = process
+        progress_callback("llmster server is ready.")
+
+    monkeypatch.setattr("screen_commentator_win.runtime.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(runtime, "_server_status_for_installation", lambda installation: {"running": False})
+    monkeypatch.setattr(runtime, "_wait_for_server", fake_wait_for_server)
+
+    runtime.start_server(progress.append)
+
+    assert captured["command"] == [
+        str(paths.lms_executable),
+        "server",
+        "start",
+        "--port",
+        str(config.runtime.port),
+    ]
+    assert captured["env"]["HOME"] == str(paths.llmster_home)
+    assert captured["env"]["USERPROFILE"] == str(paths.llmster_home)
+    assert captured["installation"].lms_executable == paths.lms_executable
+    assert progress[-1] == "llmster server is ready."
+
+
 def test_verify_model_files_requires_main_and_mmproj(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path))
     paths = AppPaths.discover()
     config = AppConfig()
-    lms_dir = paths.llmstudio_bin_dir
-    lms_dir.mkdir(parents=True, exist_ok=True)
-    (lms_dir / "lms.exe").write_bytes(b"binary")
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"binary")
     model_dir = paths.llmster_home / ".lmstudio" / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
     main_file = model_dir / "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"
@@ -212,60 +290,14 @@ def test_verify_model_files_requires_main_and_mmproj(monkeypatch, tmp_path) -> N
     assert files.mmproj_file == mmproj_file
 
 
-def test_start_server_falls_back_to_user_home_install(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path / "app-root"))
-    monkeypatch.setattr("screen_commentator_win.paths.actual_user_home", lambda: tmp_path / "user-home")
-    paths = AppPaths.discover()
-    config = AppConfig()
-    progress: list[str] = []
-    local_lms = paths.llmstudio_bin_dir
-    local_lms.mkdir(parents=True, exist_ok=True)
-    (local_lms / "lms.exe").write_bytes(b"local")
-    user_lms = tmp_path / "user-home" / ".lmstudio" / "bin"
-    user_lms.mkdir(parents=True, exist_ok=True)
-    (user_lms / "lms.exe").write_bytes(b"user")
-
-    runtime = RuntimeManager(paths=paths, config=config)
-
-    class FakeProcess:
-        def __init__(self, command, **kwargs) -> None:
-            self.command = command
-            self.stdout = []
-
-        def poll(self):
-            return None
-
-        def terminate(self) -> None:
-            return None
-
-        def wait(self, timeout=None) -> int:
-            return 0
-
-    monkeypatch.setattr("screen_commentator_win.runtime.subprocess.Popen", FakeProcess)
-    monkeypatch.setattr(runtime, "_server_status_for_installation", lambda installation: {"running": False})
-
-    def fake_wait_for_server(progress, installation=None, process=None):
-        assert installation is not None
-        if installation.lms_executable == local_lms / "lms.exe":
-            raise RuntimeErrorWithDetails("not ready")
-
-    monkeypatch.setattr(runtime, "_wait_for_server", fake_wait_for_server)
-
-    runtime.start_server(progress.append)
-
-    assert runtime.lms_executable_path == str(user_lms / "lms.exe")
-    assert any("trying another installation" in line for line in progress)
-
-
 def test_load_model_uses_model_key_and_yes_flag(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("SCW_APP_ROOT", str(tmp_path))
     paths = AppPaths.discover()
     config = AppConfig()
     progress: list[str] = []
     progress_state: list[tuple[str, float | None]] = []
-    lms_dir = paths.llmstudio_bin_dir
-    lms_dir.mkdir(parents=True, exist_ok=True)
-    (lms_dir / "lms.exe").write_bytes(b"binary")
+    paths.llmstudio_bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.lms_executable.write_bytes(b"binary")
     model_dir = paths.llmster_home / ".lmstudio" / "models" / "HauhauCS" / "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive"
     model_dir.mkdir(parents=True, exist_ok=True)
     main_file = model_dir / "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"
@@ -320,10 +352,10 @@ def test_load_model_uses_model_key_and_yes_flag(monkeypatch, tmp_path) -> None:
         lambda label, fraction: progress_state.append((label, fraction)),
     )
 
-    assert files.main_file == main_file
+    assert files == ModelFiles(main_file=main_file, mmproj_file=mmproj_file)
     assert commands == [
         [
-            str(lms_dir / "lms.exe"),
+            str(paths.lms_executable),
             "load",
             "qwen3.5-4b-uncensored-hauhaucs-aggressive",
             "--context-length",

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import subprocess
 import threading
 import time
@@ -26,6 +25,7 @@ MODEL_PREFIX = "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive"
 MODEL_KEY = MODEL_PREFIX.lower()
 MMPROJ_FILENAME = f"mmproj-{MODEL_PREFIX}-BF16.gguf"
 INSTALL_SCRIPT_URL = "https://lmstudio.ai/install.ps1"
+DAEMON_START_TIMEOUT_SEC = 60.0
 LOAD_TIMEOUT_SEC = 600.0
 LOAD_ESTIMATE_SEC_PER_GIB = 2.5
 MIN_LOAD_ESTIMATE_SEC = 8.0
@@ -47,7 +47,9 @@ class RuntimeManager:
         self.paths = paths
         self.config = config
         self.http_client = http_client or httpx.Client()
+        self._daemon_process: subprocess.Popen[str] | None = None
         self._server_process: subprocess.Popen[str] | None = None
+        self._daemon_recent_output: list[str] = []
         self._selected_installation: ResolvedLmStudioPaths | None = None
 
     @property
@@ -95,27 +97,27 @@ class RuntimeManager:
             home_root=self.paths.llmster_home,
         )
         installation = self.paths.resolve_installation()
-        if installation is None:
+        if installation is None or installation.home_root != self.paths.llmster_home:
             raise RuntimeErrorWithDetails(
-                "llmster installation finished but lms.exe could not be discovered in either the app-local "
-                f"home ({self.paths.llmster_home}) or the current user home."
+                "llmster installation did not finish inside the app-local runtime directory. "
+                f"Expected app-local install under {self.paths.llmster_home}."
             )
         self._selected_installation = installation
-        if installation.home_root == self.paths.llmster_home:
-            progress(f"Detected app-local lms.exe at {installation.lms_executable}")
-        else:
-            progress(f"Detected lms.exe at {installation.lms_executable}")
-            progress("llmster ignored the requested app-local home and installed into the current user profile.")
+        progress(f"Detected app-local lms.exe at {installation.lms_executable}")
         self._report_progress(progress_state, "llmster installed.", 1.0)
 
     def start_daemon(self, progress: ProgressCallback) -> None:
-        self._sync_app_local_cli_key(progress)
-        installations = self._candidate_installations()
-        if not installations:
+        installation = self._current_installation()
+        if installation is None:
             raise RuntimeErrorWithDetails("llmster is not installed yet. Press Install first.")
+        self._selected_installation = installation
 
-        failures: list[str] = []
-        for index, installation in enumerate(installations):
+        if self._daemon_process and self._daemon_process.poll() is None:
+            progress("Isolated llmster daemon is already running.")
+            return
+
+        key_file = installation.lmstudio_home / ".internal" / "lms-key-2"
+        if key_file.exists():
             progress(f"Starting llmster daemon via {installation.lms_executable}...")
             completed = self._run_command(
                 [str(installation.lms_executable), "daemon", "up"],
@@ -124,84 +126,87 @@ class RuntimeManager:
                 home_root=installation.home_root,
             )
             if completed.returncode == 0:
-                self._selected_installation = installation
                 return
+            progress("App-local CLI daemon command failed; restarting the isolated llmster daemon directly.")
+            key_file.unlink(missing_ok=True)
 
-            failures.append(
-                f"{installation.lms_executable} -> exit {completed.returncode}"
-            )
-            if index < len(installations) - 1:
-                progress(
-                    f"Daemon startup failed via {installation.lms_executable}; trying another installation."
-                )
-
-        raise RuntimeErrorWithDetails("Could not start llmster daemon. " + "; ".join(failures))
+        daemon_executable = self._app_local_daemon_executable()
+        progress(f"Starting isolated llmster daemon via {daemon_executable}...")
+        self._daemon_recent_output = []
+        self._daemon_process = subprocess.Popen(
+            [str(daemon_executable)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=self._runtime_environment(home_root=installation.home_root),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        assert self._daemon_process.stdout is not None
+        threading.Thread(
+            target=self._stream_process_output,
+            args=(self._daemon_process.stdout, progress, self._daemon_recent_output),
+            daemon=True,
+        ).start()
+        self._wait_for_app_local_cli_key(progress, key_file=key_file)
 
     def stop_daemon(self, progress: ProgressCallback, ignore_errors: bool = False) -> None:
         installation = self._current_installation()
         if installation is None:
             return
         progress("Stopping llmster daemon...")
-        self._run_command(
-            [str(installation.lms_executable), "daemon", "down"],
-            progress=progress,
-            check=not ignore_errors,
-        )
+        key_file = installation.lmstudio_home / ".internal" / "lms-key-2"
+        if key_file.exists():
+            self._run_command(
+                [str(installation.lms_executable), "daemon", "down"],
+                progress=progress,
+                check=not ignore_errors,
+                home_root=installation.home_root,
+            )
+        if self._daemon_process:
+            self._terminate_process(self._daemon_process)
+            self._daemon_process = None
 
     def start_server(self, progress: ProgressCallback) -> None:
-        installations = self._candidate_installations()
-        if not installations:
+        installation = self._current_installation()
+        if installation is None:
             raise RuntimeErrorWithDetails("llmster is not installed yet. Press Install first.")
-
-        failures: list[str] = []
-        for index, installation in enumerate(installations):
-            status = self._server_status_for_installation(installation)
-            if status.get("running") and int(status.get("port", 0)) == self.config.runtime.port:
-                self._selected_installation = installation
-                progress("llmster server is already running.")
-                return
-            if status.get("running"):
-                self._run_command(
-                    [str(installation.lms_executable), "server", "stop"],
-                    progress=progress,
-                    check=False,
-                    home_root=installation.home_root,
-                )
-
-            progress(
-                f"Starting llmster server on port {self.config.runtime.port} via {installation.lms_executable}..."
+        status = self._server_status_for_installation(installation)
+        if status.get("running") and int(status.get("port", 0)) == self.config.runtime.port:
+            self._selected_installation = installation
+            progress("llmster server is already running.")
+            return
+        if status.get("running"):
+            self._run_command(
+                [str(installation.lms_executable), "server", "stop"],
+                progress=progress,
+                check=False,
+                home_root=installation.home_root,
             )
-            process = subprocess.Popen(
-                [str(installation.lms_executable), "server", "start", "--port", str(self.config.runtime.port)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=self._runtime_environment(home_root=installation.home_root),
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if process.stdout is not None:
-                threading.Thread(
-                    target=self._stream_process_output,
-                    args=(process.stdout, progress),
-                    daemon=True,
-                ).start()
-            try:
-                self._wait_for_server(progress, installation=installation, process=process)
-                self._selected_installation = installation
-                self._server_process = process
-                return
-            except RuntimeErrorWithDetails as exc:
-                failures.append(f"{installation.lms_executable} -> {exc}")
-                self._terminate_process(process)
-                if index < len(installations) - 1:
-                    progress(
-                        f"Server startup failed via {installation.lms_executable}; trying another installation."
-                    )
 
-        raise RuntimeErrorWithDetails("Could not start llmster server. " + "; ".join(failures))
+        progress(
+            f"Starting llmster server on port {self.config.runtime.port} via {installation.lms_executable}..."
+        )
+        self._server_process = subprocess.Popen(
+            [str(installation.lms_executable), "server", "start", "--port", str(self.config.runtime.port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=self._runtime_environment(home_root=installation.home_root),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        assert self._server_process.stdout is not None
+        threading.Thread(
+            target=self._stream_process_output,
+            args=(self._server_process.stdout, progress),
+            daemon=True,
+        ).start()
+        self._wait_for_server(progress, installation=installation, process=self._server_process)
 
     def stop_server(self, progress: ProgressCallback, ignore_errors: bool = False) -> None:
         installation = self._current_installation()
@@ -534,23 +539,6 @@ class RuntimeManager:
                 return item
         return None
 
-    def _sync_app_local_cli_key(self, progress: ProgressCallback) -> None:
-        app_key = self.paths.llmstudio_home / ".internal" / "lms-key-2"
-        if app_key.exists():
-            return
-
-        for candidate in self.paths.candidate_installations():
-            if candidate.home_root == self.paths.llmster_home:
-                continue
-            source_key = candidate.lmstudio_home / ".internal" / "lms-key-2"
-            if not source_key.exists():
-                continue
-
-            app_key.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_key, app_key)
-            progress(f"Copied LM Studio CLI key into app-local runtime from {source_key}.")
-            return
-
     def _require_installation(self) -> ResolvedLmStudioPaths:
         installation = self._current_installation()
         if installation is None:
@@ -560,17 +548,12 @@ class RuntimeManager:
     def _current_installation(self) -> ResolvedLmStudioPaths | None:
         if self._selected_installation and self._selected_installation.lms_executable.exists():
             return self._selected_installation
-        installation = self.paths.resolve_installation()
+        installation = self.paths.app_local_installation()
+        if not installation.lms_executable.exists():
+            return None
         if installation is not None:
             self._selected_installation = installation
         return installation
-
-    def _candidate_installations(self) -> list[ResolvedLmStudioPaths]:
-        candidates = [candidate for candidate in self.paths.candidate_installations() if candidate.lms_executable.exists()]
-        if self._selected_installation and self._selected_installation.lms_executable.exists():
-            selected = self._selected_installation
-            return [selected] + [candidate for candidate in candidates if candidate.lms_executable != selected.lms_executable]
-        return candidates
 
     def _run_json_command(
         self,
@@ -614,10 +597,18 @@ class RuntimeManager:
             progress_state(label, fraction)
 
     @staticmethod
-    def _stream_process_output(handle, progress: ProgressCallback) -> None:
+    def _stream_process_output(
+        handle,
+        progress: ProgressCallback,
+        recent_lines: list[str] | None = None,
+    ) -> None:
         for line in handle:
             stripped = line.strip()
             if stripped:
+                if recent_lines is not None:
+                    recent_lines.append(stripped)
+                    if len(recent_lines) > 40:
+                        del recent_lines[:-40]
                 progress(stripped)
 
     @staticmethod
@@ -634,3 +625,58 @@ class RuntimeManager:
                 process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             process.kill()
+
+    def _app_local_daemon_executable(self) -> str:
+        if self.paths.llmster_install_location_file.exists():
+            try:
+                payload = json.loads(
+                    self.paths.llmster_install_location_file.read_text(encoding="utf-8")
+                )
+            except json.JSONDecodeError as exc:
+                raise RuntimeErrorWithDetails(
+                    f"Could not parse app-local llmster install metadata: {exc}"
+                ) from exc
+            path_value = str(payload.get("path", "")).strip()
+            if path_value:
+                executable = os.path.normpath(path_value)
+                if os.path.exists(executable):
+                    return executable
+
+        candidates = sorted(
+            self.paths.llmstudio_home.glob("llmster/*/llmster.exe"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            return str(candidates[0])
+        raise RuntimeErrorWithDetails(
+            "llmster is not installed correctly in the app-local runtime directory."
+        )
+
+    def _wait_for_app_local_cli_key(self, progress: ProgressCallback, key_file) -> None:
+        deadline = time.time() + DAEMON_START_TIMEOUT_SEC
+        while time.time() < deadline:
+            if key_file.exists():
+                progress("Isolated llmster daemon is ready.")
+                return
+
+            if self._daemon_process:
+                return_code = self._daemon_process.poll()
+                if return_code is not None:
+                    message = self._daemon_start_failure_message(return_code)
+                    self._daemon_process = None
+                    raise RuntimeErrorWithDetails(message)
+
+            time.sleep(0.5)
+        raise RuntimeErrorWithDetails("Timed out waiting for the isolated llmster daemon to initialize.")
+
+    def _daemon_start_failure_message(self, return_code: int) -> str:
+        recent_output = "\n".join(self._daemon_recent_output[-8:])
+        if "LM Studio is already running with built-in llmster" in recent_output:
+            return (
+                "Could not start the isolated app-local llmster daemon because LM Studio is currently running. "
+                "Close LM Studio completely and try again."
+            )
+        if recent_output:
+            return f"Could not start the isolated app-local llmster daemon (exit {return_code}). {recent_output}"
+        return f"Could not start the isolated app-local llmster daemon (exit {return_code})."

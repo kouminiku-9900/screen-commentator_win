@@ -77,6 +77,8 @@ pwsh -File .\scripts\build.ps1
 - `Start` は server 起動、model load、コメント生成、overlay 表示まで行います。
 - `Stop` は生成停止、overlay clear、model unload、server 停止、daemon 停止を行います。
 - `%LOCALAPPDATA%` を汚したくないテストでは `SCW_APP_ROOT` を使えます。
+- この fork は毎回 `%LOCALAPPDATA%\ScreenCommentatorWin\llmster-home\` の app-local runtime だけを使います。
+- LM Studio デスクトップアプリが起動中だと isolated `llmster` を起動できないので、このランチャーを使う前に LM Studio は閉じてください。
 
 ## Uninstall
 
@@ -88,19 +90,8 @@ pwsh -File .\scripts\build.ps1
 - 配布版を展開したフォルダ
 - 必要なら `release\ScreenCommentatorLauncher\` と `release\ScreenCommentatorLauncher-win64.zip`
 
-### If LM Studio user-profile storage was used
-
-環境によっては `llmster` / model が既存の user-profile 側 LM Studio を使うことがあります。  
-その場合、固定モデルは次の場所に入っている可能性があります。
-
-- `%USERPROFILE%\.lmstudio\models\HauhauCS\Qwen3.5-4B-Uncensored-HauhauCS-Aggressive\`
-
-このモデルだけ不要なら、そのフォルダだけ削除してください。
-
-### Important caution
-
-すでに LM Studio を他用途で使っている場合は、`%USERPROFILE%\.lmstudio\` 全体を削除しないでください。  
-この fork が使うモデルだけを消したい場合は、上のモデルディレクトリだけを削除するのが安全です。
+この fork は user-profile 側の `%USERPROFILE%\.lmstudio\` を使いません。  
+アンインストール対象は app-local の `%LOCALAPPDATA%\ScreenCommentatorWin\` だけです。
 
 ## License
 

@@ -1,18 +1,12 @@
 from __future__ import annotations
 
 import os
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 
 APP_DIR_NAME = "ScreenCommentatorWin"
 APP_ROOT_ENV = "SCW_APP_ROOT"
-
-
-def actual_user_home() -> Path:
-    return Path.home()
 
 
 @dataclass(frozen=True)
@@ -32,6 +26,7 @@ class AppPaths:
     llmstudio_home: Path
     llmstudio_bin_dir: Path
     lms_executable: Path
+    llmster_install_location_file: Path
     install_script_cache: Path
     app_log_file: Path
 
@@ -54,6 +49,7 @@ class AppPaths:
                 llmstudio_home=llmstudio_home,
                 llmstudio_bin_dir=llmstudio_bin_dir,
                 lms_executable=llmstudio_bin_dir / "lms.exe",
+                llmster_install_location_file=llmstudio_home / ".internal" / "llmster-install-location.json",
                 install_script_cache=state_dir / "install-llmster.ps1",
                 app_log_file=logs_dir / "screen-commentator.log",
             )
@@ -80,6 +76,7 @@ class AppPaths:
             llmstudio_home=llmstudio_home,
             llmstudio_bin_dir=llmstudio_bin_dir,
             lms_executable=llmstudio_bin_dir / "lms.exe",
+            llmster_install_location_file=llmstudio_home / ".internal" / "llmster-install-location.json",
             install_script_cache=state_dir / "install-llmster.ps1",
             app_log_file=logs_dir / "screen-commentator.log",
         )
@@ -89,41 +86,20 @@ class AppPaths:
             path.mkdir(parents=True, exist_ok=True)
 
     def resolve_installation(self) -> ResolvedLmStudioPaths | None:
-        for candidate in self.candidate_installations():
-            if candidate.lms_executable.exists():
-                return candidate
+        candidate = self.app_local_installation()
+        if candidate.lms_executable.exists():
+            return candidate
         return None
 
     def candidate_installations(self) -> list[ResolvedLmStudioPaths]:
-        seen_lmstudio_homes: set[Path] = set()
-        candidates: list[ResolvedLmStudioPaths] = []
-        for home_root in (self.llmster_home, actual_user_home()):
-            lmstudio_home = self._lmstudio_home_for_home_root(home_root)
-            if lmstudio_home in seen_lmstudio_homes:
-                continue
-            seen_lmstudio_homes.add(lmstudio_home)
-            candidates.append(
-                ResolvedLmStudioPaths(
-                    home_root=home_root,
-                    lmstudio_home=lmstudio_home,
-                    lms_executable=lmstudio_home / "bin" / "lms.exe",
-                )
-            )
+        return [self.app_local_installation()]
 
-        command_source = shutil.which("lms")
-        if command_source:
-            command_path = Path(command_source)
-            lmstudio_home = command_path.parent.parent
-            if lmstudio_home not in seen_lmstudio_homes:
-                candidates.append(
-                    ResolvedLmStudioPaths(
-                        home_root=None,
-                        lmstudio_home=lmstudio_home,
-                        lms_executable=command_path,
-                    )
-                )
-
-        return candidates
+    def app_local_installation(self) -> ResolvedLmStudioPaths:
+        return ResolvedLmStudioPaths(
+            home_root=self.llmster_home,
+            lmstudio_home=self._lmstudio_home_for_home_root(self.llmster_home),
+            lms_executable=self.lms_executable,
+        )
 
     @staticmethod
     def _lmstudio_home_for_home_root(home_root: Path) -> Path:
