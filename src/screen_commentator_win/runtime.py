@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import subprocess
 import threading
 import time
@@ -260,39 +259,53 @@ class RuntimeManager:
         progress_state: ProgressStateCallback | None = None,
     ) -> None:
         self._report_progress(progress_state, "Queueing model download...", None)
-        progress("Queueing model download via llmster CLI...")
-        installation = self._require_installation()
-        command = [
-            str(installation.lms_executable),
-            "get",
-            self._download_request_target(),
-            "--yes",
-        ]
-        progress(f"$ {' '.join(command)}")
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=self._runtime_environment(home_root=installation.home_root),
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        progress("Queueing model download via llmster local API...")
+        payload = {
+            "model": self.config.runtime.model_repo_url,
+            "quantization": self.config.runtime.quantization,
+        }
+        response = self.http_client.post(
+            f"{self.base_url}/api/v1/models/download",
+            json=payload,
+            timeout=30.0,
         )
-        try:
-            self._stream_download_output(
-                process=process,
-                progress=progress,
-                progress_state=progress_state,
-            )
-        finally:
-            if process.poll() is None:
-                self._terminate_process(process)
+        response.raise_for_status()
+        data = response.json()
+        status = data.get("status")
+        if status in {"already_downloaded", "completed"}:
+            progress("Model is already available locally.")
+            self._report_progress(progress_state, "Model is already available locally.", 1.0)
+            return
 
-        self.verify_model_files()
-        progress("Model download completed.")
-        self._report_progress(progress_state, "Model download completed.", 1.0)
+        job_id = data.get("job_id")
+        if not job_id:
+            raise RuntimeErrorWithDetails(f"Unexpected download response: {data}")
+
+        while True:
+            time.sleep(2.0)
+            poll = self.http_client.get(
+                f"{self.base_url}/api/v1/models/download/status/{job_id}",
+                timeout=30.0,
+            )
+            poll.raise_for_status()
+            status_payload = poll.json()
+            current_status = status_payload.get("status")
+            downloaded_bytes = int(status_payload.get("downloaded_bytes", 0))
+            total_size = int(status_payload.get("total_size_bytes", 0))
+            if total_size > 0:
+                percent = downloaded_bytes / total_size * 100
+                progress(f"Downloading model... {percent:.1f}%")
+                self._report_progress(progress_state, "Downloading model...", percent / 100.0)
+            else:
+                progress(f"Downloading model... {current_status}")
+                self._report_progress(progress_state, f"Downloading model... {current_status}", None)
+
+            if current_status == "completed":
+                progress("Model download completed.")
+                self._report_progress(progress_state, "Model download completed.", 1.0)
+                return
+            if current_status == "failed":
+                raise RuntimeErrorWithDetails(f"Model download failed: {status_payload}")
 
     def verify_model_files(self) -> ModelFiles:
         installation = self._require_installation()
@@ -655,42 +668,6 @@ class RuntimeManager:
             f"Expected to find {owner}/{repo} inside {search_root}."
         )
 
-    def _download_request_target(self) -> str:
-        owner, repo = self._configured_repo_parts()
-        quantization = self.config.runtime.quantization.strip()
-        if not quantization:
-            raise RuntimeErrorWithDetails("runtime.quantization must not be empty.")
-        return f"{owner}/{repo}@{quantization.lower()}"
-
-    def _stream_download_output(
-        self,
-        *,
-        process: subprocess.Popen[str],
-        progress: ProgressCallback,
-        progress_state: ProgressStateCallback | None,
-    ) -> None:
-        if process.stdout is None:
-            raise RuntimeErrorWithDetails("llmster get did not provide any output.")
-
-        saw_fraction = False
-        for raw_line in process.stdout:
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            progress(line)
-            fraction = self._download_fraction_from_line(line)
-            if fraction is not None:
-                saw_fraction = True
-                self._report_progress(progress_state, "Downloading model...", fraction)
-
-        return_code = process.wait(timeout=600)
-        if return_code != 0:
-            raise RuntimeErrorWithDetails(f"llmster get failed with exit code {return_code}.")
-
-        if not saw_fraction:
-            self._report_progress(progress_state, "Downloading model...", 1.0)
-
     def _configured_repo_parts(self) -> tuple[str, str]:
         raw = self.config.runtime.model_repo_url.strip().rstrip("/")
         if not raw:
@@ -721,17 +698,6 @@ class RuntimeManager:
             exact_matches.sort(key=lambda path: (len(path.parts), len(path.name)))
             return exact_matches[0]
         return None
-
-    @staticmethod
-    def _download_fraction_from_line(line: str) -> float | None:
-        match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
-        if not match:
-            return None
-        try:
-            percent = float(match.group(1))
-        except ValueError:
-            return None
-        return max(0.0, min(1.0, percent / 100.0))
 
     @staticmethod
     def _find_mmproj_file(repo_root):
