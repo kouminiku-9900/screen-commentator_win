@@ -119,6 +119,13 @@ class AppController(QObject):
             self.runtime.start_daemon(self._emit_log)
             self._set_progress("Starting llmster server...", None)
             self.runtime.start_server(self._emit_log)
+
+            try:
+                self.runtime.verify_model_files()
+            except RuntimeErrorWithDetails:
+                self._set_progress("Downloading model...", None)
+                self.runtime.download_model(self._emit_log, self._set_progress)
+
             self._set_progress("Loading multimodal model...", None)
             files = self.runtime.load_model(self._emit_log, self._set_progress)
             self._emit_log(f"Loaded model from {files.main_file}")

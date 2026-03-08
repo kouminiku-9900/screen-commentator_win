@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 INSTALL_SCRIPT_URL = "https://lmstudio.ai/install.ps1"
 DAEMON_START_TIMEOUT_SEC = 60.0
+DAEMON_STABILIZATION_SEC = 3.0
 LOAD_TIMEOUT_SEC = 600.0
 LOAD_ESTIMATE_SEC_PER_GIB = 2.5
 MIN_LOAD_ESTIMATE_SEC = 8.0
@@ -113,6 +115,28 @@ class RuntimeManager:
             progress("Isolated llmster daemon is already running.")
             return
 
+        self._kill_stale_daemons(progress)
+
+        last_error: RuntimeErrorWithDetails | None = None
+        for attempt in range(2):
+            try:
+                self._attempt_daemon_start(progress, installation)
+                return
+            except RuntimeErrorWithDetails as exc:
+                last_error = exc
+                if attempt == 0 and "already running" in str(exc).lower():
+                    progress("Detected another llmster instance; retrying after cleanup...")
+                    self._kill_stale_daemons(progress)
+                    time.sleep(2.0)
+                    continue
+                raise
+
+        assert last_error is not None
+        raise last_error
+
+    def _attempt_daemon_start(
+        self, progress: ProgressCallback, installation: ResolvedLmStudioPaths
+    ) -> None:
         key_file = installation.lmstudio_home / ".internal" / "lms-key-2"
         if key_file.exists():
             progress(f"Starting llmster daemon via {installation.lms_executable}...")
@@ -258,6 +282,18 @@ class RuntimeManager:
         progress: ProgressCallback,
         progress_state: ProgressStateCallback | None = None,
     ) -> None:
+        try:
+            self._download_model_rest(progress, progress_state)
+        except (httpx.HTTPStatusError, httpx.ConnectError) as exc:
+            logger.info("REST model download not available (%s), falling back to CLI.", exc)
+            progress("REST download API not available; using CLI fallback...")
+            self._download_model_cli(progress, progress_state)
+
+    def _download_model_rest(
+        self,
+        progress: ProgressCallback,
+        progress_state: ProgressStateCallback | None = None,
+    ) -> None:
         self._report_progress(progress_state, "Queueing model download...", None)
         progress("Queueing model download via llmster local API...")
         payload = {
@@ -306,6 +342,71 @@ class RuntimeManager:
                 return
             if current_status == "failed":
                 raise RuntimeErrorWithDetails(f"Model download failed: {status_payload}")
+
+    def _download_model_cli(
+        self,
+        progress: ProgressCallback,
+        progress_state: ProgressStateCallback | None = None,
+    ) -> None:
+        self._report_progress(progress_state, "Queueing model download...", None)
+        progress("Queueing model download via llmster CLI...")
+        installation = self._require_installation()
+        owner, repo = self._configured_repo_parts()
+        quantization = self.config.runtime.quantization.strip()
+        target = f"{owner}/{repo}@{quantization.lower()}"
+        command = [
+            str(installation.lms_executable),
+            "get",
+            target,
+            "--yes",
+        ]
+        progress(f"$ {' '.join(command)}")
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=self._runtime_environment(home_root=installation.home_root),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            self._stream_download_output(process, progress, progress_state)
+        finally:
+            if process.poll() is None:
+                self._terminate_process(process)
+        progress("Model download completed.")
+        self._report_progress(progress_state, "Model download completed.", 1.0)
+
+    def _stream_download_output(
+        self,
+        process: subprocess.Popen[str],
+        progress: ProgressCallback,
+        progress_state: ProgressStateCallback | None,
+    ) -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            stripped = line.strip()
+            if stripped:
+                progress(stripped)
+                fraction = self._download_fraction_from_line(stripped)
+                if fraction is not None:
+                    self._report_progress(progress_state, "Downloading model...", fraction)
+
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeErrorWithDetails(
+                f"CLI model download failed with exit code {return_code}."
+            )
+
+    @staticmethod
+    def _download_fraction_from_line(line: str) -> float | None:
+        match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+        if match:
+            return min(1.0, float(match.group(1)) / 100.0)
+        return None
 
     def verify_model_files(self) -> ModelFiles:
         installation = self._require_installation()
@@ -722,10 +823,74 @@ class RuntimeManager:
         candidates.sort(key=lambda path: (len(path.parts), len(path.name)))
         return candidates[0]
 
+    def _kill_stale_daemons(self, progress: ProgressCallback) -> None:
+        if self._daemon_process and self._daemon_process.poll() is None:
+            return
+
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    (
+                        "Get-Process -Name llmster -ErrorAction SilentlyContinue "
+                        "| Select-Object -Property Id, Path "
+                        "| ConvertTo-Json -Compress"
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return
+
+        stdout = result.stdout.strip()
+        if not stdout:
+            return
+
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            return
+
+        if isinstance(payload, dict):
+            payload = [payload]
+
+        app_local_prefix = str(self.paths.llmster_home).lower()
+        for entry in payload:
+            exe_path = str(entry.get("Path", "")).lower()
+            pid = entry.get("Id")
+            if not pid:
+                continue
+            if exe_path.startswith(app_local_prefix):
+                progress(f"Terminating stale llmster daemon (PID {pid})...")
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", str(pid)],
+                        capture_output=True,
+                        timeout=10,
+                        check=False,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+
+        installation = self._current_installation()
+        if installation is not None:
+            key_file = installation.lmstudio_home / ".internal" / "lms-key-2"
+            key_file.unlink(missing_ok=True)
+
     def _wait_for_app_local_cli_key(self, progress: ProgressCallback, key_file) -> None:
         deadline = time.time() + DAEMON_START_TIMEOUT_SEC
         while time.time() < deadline:
             if key_file.exists():
+                self._verify_daemon_stable(progress, key_file)
                 progress("Isolated llmster daemon is ready.")
                 return
 
@@ -739,12 +904,31 @@ class RuntimeManager:
             time.sleep(0.5)
         raise RuntimeErrorWithDetails("Timed out waiting for the isolated llmster daemon to initialize.")
 
+    def _verify_daemon_stable(self, progress: ProgressCallback, key_file) -> None:
+        if not self._daemon_process:
+            return
+
+        deadline = time.time() + DAEMON_STABILIZATION_SEC
+        while time.time() < deadline:
+            return_code = self._daemon_process.poll()
+            if return_code is not None:
+                key_file.unlink(missing_ok=True)
+                message = self._daemon_start_failure_message(return_code)
+                self._daemon_process = None
+                raise RuntimeErrorWithDetails(message)
+            time.sleep(0.5)
+
     def _daemon_start_failure_message(self, return_code: int) -> str:
         recent_output = "\n".join(self._daemon_recent_output[-8:])
         if "LM Studio is already running with built-in llmster" in recent_output:
             return (
                 "Could not start the isolated app-local llmster daemon because LM Studio is currently running. "
                 "Close LM Studio completely and try again."
+            )
+        if "already running" in recent_output.lower():
+            return (
+                f"Could not start the isolated app-local llmster daemon (exit {return_code}). "
+                f"Another llmster instance is already running. {recent_output}"
             )
         if recent_output:
             return f"Could not start the isolated app-local llmster daemon (exit {return_code}). {recent_output}"

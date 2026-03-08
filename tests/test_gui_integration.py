@@ -202,7 +202,7 @@ def test_start_and_stop_flow_updates_overlay_and_buttons(qtbot, tmp_path) -> Non
     qtbot.waitUntil(lambda: window.stop_button.isEnabled())
     qtbot.waitUntil(lambda: len(overlay.active_comments) == 1)
 
-    assert runtime.calls[:3] == ["start_daemon", "start_server", "load_model"]
+    assert runtime.calls[:4] == ["start_daemon", "start_server", "verify_model_files", "load_model"]
     assert overlay.isVisible()
 
     qtbot.mouseClick(window.stop_button, Qt.MouseButton.LeftButton)

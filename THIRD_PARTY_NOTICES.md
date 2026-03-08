@@ -12,7 +12,6 @@ The intended public distribution for this project is the source repository itsel
 
 - `llmster` / LM Studio is not included in git.
 - Models are not included in git.
-- Local `release/` build artifacts are generated on the user's machine and are not treated as official public binary releases by this repository.
 
 ## Third-Party Components Used By The Project
 
@@ -45,24 +44,13 @@ The intended public distribution for this project is the source repository itsel
 - `tomli-w`
   - Declared license: MIT
 
-### Development and packaging dependencies
-
-- `PyInstaller`
-  - Declared license: GPL-2.0-or-later with bootloader exception
+### Development dependencies
 
 - `pytest`
   - Included only for development and test
 
 - `pytest-qt`
   - Included only for development and test
-
-## Redistribution Caution
-
-If you locally build a Windows executable, your output may contain third-party binaries and libraries such as Qt / PySide6.
-
-- Review the upstream license terms before sharing those binaries publicly.
-- If you redistribute a local build, include the relevant license texts and notices for bundled dependencies.
-- This repository makes no claim that a user-built binary is automatically cleared for redistribution in every jurisdiction or use case.
 
 ## Trademarks
 

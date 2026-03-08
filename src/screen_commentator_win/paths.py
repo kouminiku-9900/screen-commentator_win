@@ -34,25 +34,7 @@ class AppPaths:
     def discover(cls) -> "AppPaths":
         override_root = os.environ.get(APP_ROOT_ENV)
         if override_root:
-            root = Path(override_root).expanduser()
-            logs_dir = root / "logs"
-            state_dir = root / "state"
-            llmster_home = root / "llmster-home"
-            llmstudio_home = llmster_home / ".lmstudio"
-            llmstudio_bin_dir = llmstudio_home / "bin"
-            return cls(
-                root=root,
-                config_file=root / "config.toml",
-                logs_dir=logs_dir,
-                state_dir=state_dir,
-                llmster_home=llmster_home,
-                llmstudio_home=llmstudio_home,
-                llmstudio_bin_dir=llmstudio_bin_dir,
-                lms_executable=llmstudio_bin_dir / "lms.exe",
-                llmster_install_location_file=llmstudio_home / ".internal" / "llmster-install-location.json",
-                install_script_cache=state_dir / "install-llmster.ps1",
-                app_log_file=logs_dir / "screen-commentator.log",
-            )
+            return cls._from_root(Path(override_root).expanduser())
 
         local_appdata = os.environ.get("LOCALAPPDATA")
         if local_appdata:
@@ -60,7 +42,10 @@ class AppPaths:
         else:
             base_root = Path.home() / "AppData" / "Local"
 
-        root = base_root / APP_DIR_NAME
+        return cls._from_root(base_root / APP_DIR_NAME)
+
+    @classmethod
+    def _from_root(cls, root: Path) -> "AppPaths":
         logs_dir = root / "logs"
         state_dir = root / "state"
         llmster_home = root / "llmster-home"
