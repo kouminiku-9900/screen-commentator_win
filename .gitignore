@@ -1,0 +1,13 @@
+.venv/
+build/
+dist/
+release/
+.pyinstaller/
+Microsoft/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.spec
+.pytest_cache/
+.mypy_cache/

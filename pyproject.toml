@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "screen-commentator-win"
+version = "0.1.0"
+description = "Windows-native screen commentator launcher built around llmster and a multimodal Qwen model."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "httpx>=0.27.2,<1.0.0",
+  "mss>=10.0.0,<11.0.0",
+  "Pillow>=11.1.0,<12.0.0",
+  "PySide6>=6.8.2,<7.0.0",
+  "tomli-w>=1.2.0,<2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pyinstaller>=6.12.0,<7.0.0",
+  "pytest>=8.3.5,<9.0.0",
+  "pytest-qt>=4.4.0,<5.0.0",
+]
+
+[project.scripts]
+screen-commentator-win = "screen_commentator_win.app:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "real_runtime: opt-in end-to-end test against llmster and the fixed Hugging Face model.",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
