@@ -92,8 +92,11 @@ class AppController(QObject):
     def _install_impl(self) -> None:
         self._emit_status("Installing runtime and model...")
         try:
-            self._set_progress("Downloading llmster installer...", None)
-            self.runtime.install_llmster(self._emit_log, self._set_progress)
+            if self.runtime.is_installed():
+                self._emit_log("llmster is already installed. Skipping installation.")
+            else:
+                self._set_progress("Downloading llmster installer...", None)
+                self.runtime.install_llmster(self._emit_log, self._set_progress)
             self._set_progress("Starting llmster daemon...", None)
             self.runtime.start_daemon(self._emit_log)
             self._set_progress("Starting llmster server...", None)

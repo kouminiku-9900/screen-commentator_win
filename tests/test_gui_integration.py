@@ -148,7 +148,6 @@ def test_install_button_runs_runtime_sequence(qtbot, tmp_path) -> None:
     qtbot.waitUntil(lambda: window.status_label.text() == "Install completed.")
 
     assert runtime.calls == [
-        "install_llmster",
         "start_daemon",
         "start_server",
         "download_model",
